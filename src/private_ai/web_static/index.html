@@ -1,0 +1,44 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>private_ai</title>
+<link rel="stylesheet" href="app.css">
+</head>
+<body>
+<aside id="sidebar">
+  <button id="new" type="button">New conversation</button>
+  <ul id="conversations"></ul>
+  <button id="memory-open" type="button" class="quiet">Memory</button>
+</aside>
+<main>
+  <header>
+    <button id="menu" type="button" class="quiet" aria-label="Conversations">&#9776;</button>
+    <label>Provider <select id="provider"></select></label>
+    <label>Model <select id="model"></select></label>
+    <p id="policy"></p>
+  </header>
+  <div id="title-bar"><span id="title-emoji"></span><h1 id="title"></h1></div>
+  <section id="transcript" aria-live="polite"></section>
+  <form id="composer">
+    <textarea id="input" rows="2" placeholder="Message (Enter to send, Shift+Enter for a new line)"></textarea>
+    <button id="send" type="submit">Send</button>
+    <button id="stop" type="button" hidden>Stop</button>
+  </form>
+</main>
+<dialog id="memory">
+  <h2>What is remembered about you</h2>
+  <p class="hint">Given to the model at the start of every conversation.</p>
+  <ul id="facts"></ul>
+  <button id="memory-close" type="button">Close</button>
+</dialog>
+<dialog id="move">
+  <h2>Move this exchange to&hellip;</h2>
+  <p class="hint">The question and its answer are added to the end of the conversation you pick.</p>
+  <ul id="targets"></ul>
+  <button id="move-close" type="button">Cancel</button>
+</dialog>
+<script src="app.js"></script>
+</body>
+</html>

@@ -13,6 +13,7 @@ Configuration lives only on this machine:
 
     [providers.fireworks]
     model = "accounts/fireworks/models/..."
+    context_tokens = 100000              # conversation size before older parts are summarised
 
     [providers.bedrock]
     region = "us-west-2"
@@ -42,6 +43,10 @@ class Provider:
     key_env: str | None = None  # environment variable holding the API key
     api_key: str | None = None
     model: str | None = None  # None: use the first model the endpoint lists
+    # How much conversation to send before the earlier part is replaced by a
+    # summary. An estimate, kept well under most models' limits; it also caps
+    # what each message costs.
+    context_tokens: int = 48_000
     # The provider's own published data-handling policy. This program cannot
     # verify these claims; the URL is here so the user can.
     policy_url: str | None = None
@@ -141,7 +146,7 @@ def load_providers(path: Path | None = None) -> dict[str, Provider]:
     providers = _builtin(region)
 
     for name, entry in settings.items():
-        fields = {k: entry[k] for k in ("base_url", "key_env", "api_key", "model") if k in entry}
+        fields = {k: entry[k] for k in ("base_url", "key_env", "api_key", "model", "context_tokens") if k in entry}
         if name in providers:
             providers[name] = replace(providers[name], **fields)
         elif "base_url" in fields:

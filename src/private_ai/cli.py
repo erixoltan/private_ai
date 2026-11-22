@@ -1,4 +1,4 @@
-"""Command line: chat with the agent, list providers, run connectivity checks."""
+"""Command line: chat with the agent in the terminal or a local web page, list providers, run connectivity checks."""
 
 from __future__ import annotations
 
@@ -55,6 +55,15 @@ def main(argv: list[str] | None = None) -> int:
     p_chat.add_argument(
         "--resume", nargs="?", const="latest", metavar="ID", help="continue the latest conversation, or the one with this id"
     )
+    p_web = sub.add_parser("web", help="serve a web interface on this machine only, until you press Ctrl-C")
+    p_web.add_argument("--port", type=int, default=8765, help="port on 127.0.0.1 (default: 8765)")
+    p_web.add_argument(
+        "--detached-timeout",
+        type=float,
+        default=120,
+        metavar="SECONDS",
+        help="how long a reply may keep going after its browser tab is closed (default: 120)",
+    )
     sub.add_parser("providers", help="show configured providers and their data policies")
     p_check = sub.add_parser("check", help="test connectivity to providers")
     p_check.add_argument("names", nargs="*", help="providers to check (default: all)")
@@ -74,6 +83,11 @@ def main(argv: list[str] | None = None) -> int:
         from private_ai.terminal import run_chat
 
         return run_chat(providers, args.provider or default_provider_name(), args.model, args.resume)
+
+    if args.command == "web":
+        from private_ai.web import run_web
+
+        return run_web(providers, default_provider_name(), args.port, args.detached_timeout)
 
     if args.command == "providers":
         for p in providers.values():

@@ -149,16 +149,22 @@ def chat_stream(
     model: str | None = None,
     tools: list[dict] | None = None,
     on_text: Callable[[str], None] = lambda delta: None,
+    on_thinking: Callable[[str], None] = lambda delta: None,
     timeout: float = 300,
 ) -> dict:
     """Stream a chat completion. Calls on_text for each piece of the reply and
-    returns the complete assistant message, including any tool calls."""
+    on_thinking for each piece of the model's reasoning, and returns the
+    complete assistant message, including any tool calls.
+
+    Reasoning is returned under the non-standard key "thinking". It is for
+    display only: remove it before sending the message back to a provider."""
     model = check_model(provider, model, timeout)
     body: dict = {"model": model, "messages": messages, "stream": True}
     if tools:
         body["tools"] = tools
 
     text: list[str] = []
+    thinking: list[str] = []
     calls: list[dict] = []
     slots: dict[int, dict] = {}  # stream index -> call being assembled
     with _open(provider, provider.base_url + "/chat/completions", body, timeout) as resp:
@@ -174,6 +180,10 @@ def chat_stream(
                 raise ProviderError(f"provider error mid-stream: {json.dumps(chunk['error'])[:300]}")
             for choice in chunk.get("choices") or []:
                 delta = choice.get("delta") or {}
+                reasoning = delta.get("reasoning_content") or delta.get("reasoning")
+                if isinstance(reasoning, str) and reasoning:
+                    thinking.append(reasoning)
+                    on_thinking(reasoning)
                 if delta.get("content"):
                     text.append(delta["content"])
                     on_text(delta["content"])
@@ -190,6 +200,8 @@ def chat_stream(
                     call["arguments"] += fn.get("arguments") or ""
 
     message: dict = {"role": "assistant", "content": "".join(text)}
+    if thinking:
+        message["thinking"] = "".join(thinking)
     if calls:
         message["tool_calls"] = [
             {

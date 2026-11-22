@@ -20,14 +20,29 @@ class FakeModel(BaseHTTPRequestHandler):
 
     script: list = []
     requests: list = []
+    side_replies: list = []  # answers to non-streaming requests (summaries, titles); "no" when empty
+    side_requests: list = []
 
-    def do_GET(self):  # /api/tags: not an Ollama server
-        self.send_response(404)
-        self.send_header("Content-Length", "0")
+    def do_GET(self):
+        found = self.path == "/v1/models"  # anything else (/api/tags): not an Ollama server
+        body = b'{"data": [{"id": "x/models/kimi-2"}, {"id": "m"}, {"id": "x/routers/Kimi-1"}, {"id": "glm"}]}' if found else b""
+        self.send_response(200 if found else 404)
+        self.send_header("Content-Length", str(len(body)))
         self.end_headers()
+        self.wfile.write(body)
 
     def do_POST(self):
-        FakeModel.requests.append(json.loads(self.rfile.read(int(self.headers["Content-Length"]))))
+        request = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+        if not request["stream"]:
+            FakeModel.side_requests.append(request)
+            reply = FakeModel.side_replies.pop(0) if FakeModel.side_replies else "no"
+            body = json.dumps({"choices": [{"message": {"role": "assistant", "content": reply}}]}).encode()
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+        FakeModel.requests.append(request)
         step = FakeModel.script.pop(0)
         if isinstance(step, int):
             body = b'{"error": "this model does not support tools"}'
@@ -36,7 +51,9 @@ class FakeModel(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(body)
             return
-        if isinstance(step, str):
+        if isinstance(step, dict):  # a reply preceded by reasoning
+            deltas = [{"reasoning_content": step["thinking"]}, {"content": step["text"]}]
+        elif isinstance(step, str):
             deltas = [{"content": step[:2]}, {"content": step[2:]}]
         else:  # tool call with its arguments split across chunks, as real providers do
             name, args = step[0], json.dumps(step[1])
@@ -65,6 +82,9 @@ class FakeUI:
     def text(self, delta):
         self.shown += delta
 
+    def thinking(self, delta):
+        self.thought = getattr(self, "thought", "") + delta
+
     def notice(self, message):
         self.notices.append(message)
 
@@ -91,9 +111,142 @@ class AgentTest(unittest.TestCase):
         self.dir = Path(self.tmp.name).resolve()
         self.store = Store(self.dir / "data")
         FakeModel.script, FakeModel.requests = [], []
+        FakeModel.side_replies, FakeModel.side_requests = [], []
 
-    def agent(self, ui, conversation=None):
-        return Agent(self.provider, "m", self.store, ui, conversation)
+    def agent(self, ui, conversation=None, provider=None):
+        return Agent(provider or self.provider, "m", self.store, ui, conversation)
+
+    # ---- moving an exchange ----
+
+    def two_conversations(self):
+        FakeModel.script = ["a1", "a2", ("remember", {"fact": "Likes plums."}), "a3", "b1"]
+        a, b = self.agent(FakeUI()), self.agent(FakeUI())
+        for text in ("qa1", "qa2", "qa3"):
+            a.send(text)
+        b.send("qb1")
+        return a.conversation["id"], b.conversation["id"]
+
+    def contents(self, conversation_id):
+        return [m.get("content") or m["role"] for m in self.store.load(conversation_id)["messages"]]
+
+    def test_move_exchange_to_another_conversation(self):
+        a, b = self.two_conversations()
+        target, emptied = self.store.move_exchange(a, 1, b)
+        self.assertEqual((target["id"], emptied), (b, False))
+        self.assertEqual(self.contents(a), ["qa1", "a1", "qa3", "assistant", "Saved.", "a3"])
+        self.assertEqual(self.contents(b), ["qb1", "b1", "qa2", "a2"])
+
+    def test_move_keeps_tool_calls_with_their_exchange_and_latest_is_minus_one(self):
+        a, b = self.two_conversations()
+        self.store.move_exchange(a, -1, b)
+        self.assertEqual(self.contents(a), ["qa1", "a1", "qa2", "a2"])
+        self.assertEqual(self.contents(b), ["qb1", "b1", "qa3", "assistant", "Saved.", "a3"])
+
+    def test_move_to_new_conversation_and_emptying_the_source_deletes_it(self):
+        a, b = self.two_conversations()
+        new, emptied = self.store.move_exchange(a, 0)
+        self.assertEqual((self.contents(new["id"]), new["title"], emptied), (["qa1", "a1"], "qa1", False))
+        _, emptied = self.store.move_exchange(b, 0, a)
+        self.assertTrue(emptied)
+        self.assertNotIn(b, [c["id"] for c in self.store.list()])
+        self.assertEqual(self.contents(a)[-2:], ["qb1", "b1"])
+
+    def test_move_out_of_summarised_part_discards_the_summary(self):
+        a, b = self.two_conversations()
+        conv = self.store.load(a)
+        conv["summary"], conv["summary_upto"] = "notes mentioning qa1", 4
+        self.store.save(conv)
+        self.store.move_exchange(a, 2, b)  # after the summarised part: summary stays
+        self.assertEqual(self.store.load(a)["summary_upto"], 4)
+        self.store.move_exchange(a, 0, b)  # inside it: summary would be wrong now
+        self.assertNotIn("summary", self.store.load(a))
+        self.assertNotIn("summary_upto", self.store.load(a))
+
+    def test_move_rejects_bad_requests(self):
+        a, b = self.two_conversations()
+        for args in ((a, 7, b), (a, 0, a)):
+            with self.assertRaises(ValueError):
+                self.store.move_exchange(*args)
+        with self.assertRaises(OSError):
+            self.store.move_exchange(a, 0, "missing")
+        self.assertEqual(len(self.contents(a)), 8)
+
+    # ---- title, emoji and colour ----
+
+    def test_model_chooses_title_emoji_and_colour_once(self):
+        FakeModel.script = ["It depends on the vows.", "second"]
+        FakeModel.side_replies = ['Sure! {"title": "Wedding anniversary plans.", "emoji": "\u2764\ufe0f", "color": "Rose"}']
+        agent = self.agent(FakeUI())
+        agent.send("help me plan our anniversary")
+        saved = self.store.load(agent.conversation["id"])
+        self.assertEqual((saved["title"], saved["emoji"], saved["color"]), ("Wedding anniversary plans", "\u2764\ufe0f", "rose"))
+        self.assertIn("help me plan our anniversary", FakeModel.side_requests[0]["messages"][1]["content"])
+        agent.send("more")
+        self.assertEqual(len(FakeModel.side_requests), 1)
+
+    def test_unusable_look_is_ignored_and_retried_only_once(self):
+        FakeModel.script = ["a", "b", "c"]
+        FakeModel.side_replies = ['{"title": "T", "emoji": "robot", "color": "gray"}', '{"title": "T", "emoji": "\U0001f916", "color": "puce"}']
+        agent = self.agent(FakeUI())
+        for text in ("one", "two", "three"):
+            agent.send(text)
+        saved = self.store.load(agent.conversation["id"])
+        self.assertEqual((saved["title"], saved.get("emoji"), saved.get("color")), ("one", None, None))
+        self.assertEqual(len(FakeModel.side_requests), 2)
+
+    # ---- long conversations ----
+
+    def test_long_conversation_is_summarised_for_the_model_but_kept_on_disk(self):
+        from dataclasses import replace
+
+        small = replace(self.provider, context_tokens=400)
+        FakeModel.script = ["r1 " + "x" * 600, "r2 " + "y" * 600, "r3", "r4"]
+        FakeModel.side_replies = ["no", "no", "NOTES: user likes plums", "no"]
+        ui = FakeUI()
+        agent = self.agent(ui, provider=small)
+        agent.send("first question")
+        agent.send("second question")
+        self.assertEqual(len(FakeModel.requests[-1]["messages"]), 4)  # still sent whole
+        agent.send("third question")
+        sent = FakeModel.requests[-1]["messages"]
+        self.assertEqual([m["content"] for m in sent[1:]], ["third question"])
+        self.assertIn("NOTES: user likes plums", sent[0]["content"])
+        self.assertIn("summarising", ui.notices[0])
+        summary_request = FakeModel.side_requests[2]["messages"][1]["content"]
+        self.assertIn("User: first question", summary_request)
+        self.assertIn("Assistant: r2", summary_request)
+        saved = self.store.load(agent.conversation["id"])
+        self.assertEqual(len(saved["messages"]), 6)  # nothing is deleted
+        self.assertEqual((saved["summary"], saved["summary_upto"]), ("NOTES: user likes plums", 4))
+        # resuming later keeps using the summary
+        self.agent(FakeUI(), saved, provider=small).send("fourth question")
+        self.assertEqual([m["content"] for m in FakeModel.requests[-1]["messages"][1:]], ["third question", "r3", "fourth question"])
+
+    def test_second_summary_builds_on_the_first(self):
+        from dataclasses import replace
+
+        small = replace(self.provider, context_tokens=300)
+        FakeModel.script = ["a" * 900, "b" * 900, "c"]
+        # in order: look (1st try), summary at q2, look (2nd try), summary at q3
+        FakeModel.side_replies = ["no", "FIRST NOTES", "no", "SECOND NOTES"]
+        agent = self.agent(FakeUI(), provider=small)
+        for text in ("q1", "q2", "q3"):
+            agent.send(text)
+        self.assertIn("FIRST NOTES", FakeModel.side_requests[3]["messages"][1]["content"])
+        self.assertEqual(agent.conversation["summary"], "SECOND NOTES")
+        self.assertIn("SECOND NOTES", FakeModel.requests[-1]["messages"][0]["content"])
+
+    def test_tool_exchange_is_never_split_by_a_summary(self):
+        from dataclasses import replace
+
+        small = replace(self.provider, context_tokens=200)
+        FakeModel.script = ["z" * 900, ("remember", {"fact": "Likes plums."}), "Saved."]
+        FakeModel.side_replies = ["no", "NOTES"]
+        agent = self.agent(FakeUI(), provider=small)
+        agent.send("q1")
+        agent.send("remember I like plums")
+        roles = [m["role"] for m in FakeModel.requests[-1]["messages"]]
+        self.assertEqual(roles, ["system", "user", "assistant", "tool"])
 
     def test_plain_reply_is_streamed_and_saved(self):
         FakeModel.script = ["hello there"]

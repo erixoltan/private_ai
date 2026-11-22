@@ -55,17 +55,56 @@ class Store:
             "messages": [],  # OpenAI chat format, so any provider can continue it
         }
 
+    def _path(self, conversation_id: str) -> Path:
+        # Ids can arrive from a URL, so never let one name a file elsewhere.
+        if not re.fullmatch(r"[\w-]+", conversation_id):
+            raise FileNotFoundError(conversation_id)
+        return self.conversations / f"{conversation_id}.json"
+
     def save(self, conversation: dict) -> None:
         conversation["updated"] = time.time()
         if not conversation["title"]:
             first = next((m["content"] for m in conversation["messages"] if m["role"] == "user"), "")
             conversation["title"] = " ".join(first.split())[:60]
-        path = self.conversations / f"{conversation['id']}.json"
-        _write_private(path, json.dumps(conversation, indent=1, ensure_ascii=False))
+        _write_private(self._path(conversation["id"]), json.dumps(conversation, indent=1, ensure_ascii=False))
 
     def load(self, conversation_id: str) -> dict:
-        path = self.conversations / f"{conversation_id}.json"
-        return json.loads(path.read_text(encoding="utf-8"))
+        return json.loads(self._path(conversation_id).read_text(encoding="utf-8"))
+
+    def delete(self, conversation_id: str) -> None:
+        self._path(conversation_id).unlink(missing_ok=True)
+
+    def move_exchange(self, source_id: str, number: int, target_id: str | None = None) -> tuple[dict, bool]:
+        """Move one exchange (a user message and everything up to the next one)
+        to the end of another conversation, or to a new one if target_id is None.
+
+        number counts exchanges from 0; -1 is the latest. Returns the target
+        conversation and whether the source, left empty, was deleted.
+        """
+        source = self.load(source_id)
+        messages = source["messages"]
+        starts = [i for i, m in enumerate(messages) if m["role"] == "user"]
+        try:
+            start = starts[number]
+        except IndexError:
+            raise ValueError("no such exchange") from None
+        end = next((i for i in starts if i > start), len(messages))
+        if target_id == source_id:
+            raise ValueError("that is the conversation it is already in")
+        target = self.load(target_id) if target_id else self.new_conversation()
+
+        target["messages"] += messages[start:end]
+        self.save(target)  # target first: an interruption leaves a duplicate, never a loss
+        del messages[start:end]
+        if start < source.get("summary_upto", 0):
+            # The summary describes what just left; drop it and let it be rebuilt.
+            source.pop("summary", None)
+            source.pop("summary_upto", None)
+        if messages:
+            self.save(source)
+        else:
+            self.delete(source_id)
+        return target, not messages
 
     def list(self) -> list[dict]:
         """All conversations, most recently updated first."""
@@ -120,10 +159,14 @@ class Store:
         if fact and fact not in facts:
             self._write_memory(facts + [fact])
 
-    def forget(self, text: str) -> list[str]:
-        """Remove every remembered fact containing the text; returns what was removed."""
+    def forget(self, text: str, exact: bool = False) -> list[str]:
+        """Remove every remembered fact containing the text (or equal to it,
+        with exact=True); returns what was removed."""
         facts = self.memory()
-        removed = [f for f in facts if text.lower() in f.lower()] if text.strip() else []
+        if exact:
+            removed = [f for f in facts if f == text]
+        else:
+            removed = [f for f in facts if text.lower() in f.lower()] if text.strip() else []
         if removed:
             self._write_memory([f for f in facts if f not in removed])
         return removed

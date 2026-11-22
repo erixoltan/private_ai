@@ -26,6 +26,8 @@ class UI(Protocol):
 
     def text(self, delta: str) -> None: ...  # a piece of the model's reply
 
+    def thinking(self, delta: str) -> None: ...  # a piece of the model's reasoning
+
     def notice(self, message: str) -> None: ...  # tool activity and warnings
 
     def ask(self, question: str, choices: dict[str, str]) -> str: ...  # returns a key of choices

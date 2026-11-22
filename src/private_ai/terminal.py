@@ -2,12 +2,16 @@
 
 from __future__ import annotations
 
+import re
+import shutil
 import sys
 import time
+import unicodedata
+from collections.abc import Callable
 
-from private_ai.agent import Agent
-from private_ai.client import ProviderError, check_model, local_models
-from private_ai.providers import Provider, config_path
+from private_ai.agent import Agent, pick_model, ready
+from private_ai.client import ProviderError
+from private_ai.providers import Provider
 from private_ai.store import Store
 
 try:
@@ -19,6 +23,9 @@ HELP = """\
 /new                 start a new conversation
 /list                show saved conversations
 /resume [N]          continue conversation N from /list (default: the latest)
+/delete N            permanently delete conversation N from /list
+/move N              move the latest question and its answer to conversation N
+/move new            ... or to a new conversation
 /memory              show what is remembered about you
 /forget TEXT         delete remembered facts containing TEXT
 /provider NAME [MODEL]   switch provider (keeps the conversation)
@@ -26,23 +33,100 @@ HELP = """\
 /quit                leave (Ctrl-D also works)"""
 
 
+_LIST_MARKER = re.compile(r"[-*•]|\d+[.)]")
+
+
+def _width(text: str) -> int:
+    """Columns the text occupies; CJK and similar characters take two."""
+    return sum(0 if unicodedata.combining(c) else 2 if unicodedata.east_asian_width(c) in "WF" else 1 for c in text)
+
+
+class WordWrapper:
+    """Wraps streamed text at word boundaries.
+
+    Text arrives in arbitrary pieces, so a word is held back until it is
+    complete and then placed on whichever line it fits. The terminal width is
+    read as each word is placed, so resizing the window affects what follows.
+    Wrapped lines keep the indentation of the line they continue, and wrapped
+    list items line up under the item's text.
+    """
+
+    def __init__(self, write: Callable[[str], None], width: Callable[[], int]):
+        self.write = write
+        self.width = width
+        self.column = 0
+        self.indent = ""  # leading whitespace of the current line
+        self.spaces = ""  # whitespace seen since the last word
+        self.word = ""
+
+    def feed(self, text: str) -> None:
+        for char in text:
+            if char == "\n":
+                self._place_word()
+                self.write("\n")
+                self.column, self.indent, self.spaces = 0, "", ""
+            elif char in " \t":
+                self._place_word()
+                self.spaces += char
+            else:
+                self.word += char
+
+    def flush(self) -> None:
+        """Emit a word still being held back (call when the reply ends)."""
+        self._place_word()
+
+    def _place_word(self) -> None:
+        if not self.word:
+            return
+        if self.column == 0:
+            self.indent = self.spaces
+            if _LIST_MARKER.fullmatch(self.word):  # continuation lines align under the item's text
+                self.indent += " " * (_width(self.word) + 1)
+        elif self.column + _width(self.spaces + self.word) > self.width():
+            self.write("\n")
+            self.column, self.spaces = 0, self.indent
+        self.write(self.spaces + self.word)
+        self.column += _width(self.spaces + self.word)
+        self.spaces, self.word = "", ""
+
+
 class TerminalUI:
     def __init__(self):
         self.color = sys.stdout.isatty()
-        self.mid_line = False
+        self.wrapper = WordWrapper(sys.stdout.write, lambda: shutil.get_terminal_size().columns - 1)
+        self.in_thinking = False
 
     def _dim(self, s: str) -> str:
         return f"\033[2m{s}\033[0m" if self.color else s
 
     def end_line(self) -> None:
-        if self.mid_line:
-            print()
-            self.mid_line = False
+        self.wrapper.flush()
+        if self.wrapper.column:
+            self.wrapper.feed("\n")
+        if self.in_thinking:
+            sys.stdout.write("\033[0m")
+            self.in_thinking = False
+        sys.stdout.flush()
+
+    def thinking(self, delta: str) -> None:
+        if not self.color:
+            return  # piped output gets the reply only
+        if not self.in_thinking:
+            self.end_line()
+            sys.stdout.write("\033[2m")
+            self.in_thinking = True
+        self.wrapper.feed(delta)
+        sys.stdout.flush()
 
     def text(self, delta: str) -> None:
-        sys.stdout.write(delta)
+        if self.in_thinking:
+            self.end_line()
+        if self.color:  # only wrap for a real terminal, never for piped output
+            self.wrapper.feed(delta)
+        else:
+            self.wrapper.write(delta)
+            self.wrapper.column = 0 if delta.endswith("\n") else 1
         sys.stdout.flush()
-        self.mid_line = not delta.endswith("\n")
 
     def notice(self, message: str) -> None:
         self.end_line()
@@ -63,22 +147,6 @@ class TerminalUI:
                 return answer
 
 
-def _pick_model(provider: Provider, model: str | None) -> str:
-    model = model or provider.model
-    if model:
-        return check_model(provider, model)  # fail now, not after the user's first message
-    models = local_models(provider)
-    if not models:
-        raise ProviderError(f"{provider.name} lists no models; pass --model")
-    return models[0]
-
-
-def _ready(provider: Provider) -> Provider:
-    if provider.needs_key and not provider.api_key:
-        raise ProviderError(f"no API key for {provider.name}: set {provider.key_env} or add it to {config_path()}")
-    return provider
-
-
 def _banner(agent: Agent) -> None:
     p = agent.provider
     where = "local, nothing leaves this machine" if p.is_local else "cloud"
@@ -87,8 +155,12 @@ def _banner(agent: Agent) -> None:
         print(f"  {p.policy_note} Not verified by this program: {p.policy_url}")
 
 
+def _label(conversation: dict) -> str:
+    return f"{conversation.get('emoji', '')} {conversation['title']}".strip()
+
+
 def _show_history(conversation: dict, ui: TerminalUI) -> None:
-    print(ui._dim(f"--- continuing: {conversation['title']} ---"))
+    print(ui._dim(f"--- continuing: {_label(conversation)} ---"))
     shown = [m for m in conversation["messages"] if m["role"] in ("user", "assistant") and m.get("content")]
     for m in shown[-6:]:
         prefix = "you> " if m["role"] == "user" else ""
@@ -102,7 +174,7 @@ def run_chat(providers: dict[str, Provider], provider_name: str, model: str | No
     try:
         if provider_name not in providers:
             raise ProviderError(f"unknown provider '{provider_name}'; known: {', '.join(providers)}")
-        provider = _ready(providers[provider_name])
+        provider = ready(providers[provider_name])
         conversation = None
         if resume:
             saved = store.list()
@@ -111,7 +183,7 @@ def run_chat(providers: dict[str, Provider], provider_name: str, model: str | No
                 conversation = next((c for c in saved if c["id"] == resume), None)
             if conversation is None:
                 raise ProviderError(f"no saved conversation to resume ({resume})")
-        agent = Agent(provider, _pick_model(provider, model), store, ui, conversation)
+        agent = Agent(provider, pick_model(provider, model), store, ui, conversation)
     except ProviderError as e:
         print(f"error: {e}", file=sys.stderr)
         return 2
@@ -149,7 +221,7 @@ def run_chat(providers: dict[str, Provider], provider_name: str, model: str | No
                     listed = store.list()[:20]
                     for i, c in enumerate(listed, 1):
                         when = time.strftime("%Y-%m-%d %H:%M", time.localtime(c["updated"]))
-                        print(f"{i:3}  {when}  {c['title']}")
+                        print(f"{i:3}  {when}  {_label(c)}")
                     if not listed:
                         print("No saved conversations yet.")
                 elif command == "/resume":
@@ -159,6 +231,32 @@ def run_chat(providers: dict[str, Provider], provider_name: str, model: str | No
                         raise ValueError("no such conversation; see /list")
                     agent = Agent(agent.provider, agent.model, store, ui, listed[index])
                     _show_history(agent.conversation, ui)
+                elif command == "/delete":
+                    index = int(arg or 0) - 1
+                    if not listed or not 0 <= index < len(listed):
+                        raise ValueError("run /list first, then /delete N")
+                    doomed = listed.pop(index)
+                    store.delete(doomed["id"])
+                    print(f"Deleted: {_label(doomed)}")
+                    if doomed["id"] == agent.conversation["id"]:
+                        agent = Agent(agent.provider, agent.model, store, ui)
+                        print("New conversation.")
+                elif command == "/move":
+                    index = int(arg or 0) - 1 if arg != "new" else None
+                    if index is not None and (not listed or not 0 <= index < len(listed)):
+                        raise ValueError("run /list first, then /move N (or /move new)")
+                    target_id = listed[index]["id"] if index is not None else None
+                    try:
+                        target, emptied = store.move_exchange(agent.conversation["id"], -1, target_id)
+                    except OSError:
+                        raise ValueError("nothing in this conversation to move yet") from None
+                    print(f"Moved the latest exchange to: {_label(target) or '(new conversation)'}")
+                    listed = []
+                    if emptied:
+                        agent = Agent(agent.provider, agent.model, store, ui)
+                        print("That left this conversation empty, so it was removed. New conversation.")
+                    else:
+                        agent = Agent(agent.provider, agent.model, store, ui, store.load(agent.conversation["id"]))
                 elif command == "/memory":
                     facts = store.memory()
                     print("\n".join(f"- {f}" for f in facts) or "Nothing remembered yet.")
@@ -170,13 +268,13 @@ def run_chat(providers: dict[str, Provider], provider_name: str, model: str | No
                     name, _, new_model = arg.partition(" ")
                     if name not in providers:
                         raise ValueError(f"known providers: {', '.join(providers)}")
-                    new = _ready(providers[name])
-                    agent = Agent(new, _pick_model(new, new_model.strip() or None), store, ui, agent.conversation)
+                    new = ready(providers[name])
+                    agent = Agent(new, pick_model(new, new_model.strip() or None), store, ui, agent.conversation)
                     _banner(agent)
                 elif command == "/model":
                     if not arg:
                         raise ValueError("usage: /model NAME")
-                    agent.model = _pick_model(agent.provider, arg)
+                    agent.model = pick_model(agent.provider, arg)
                     _banner(agent)
                 else:
                     print("Unknown command. Type /help.")
@@ -184,8 +282,11 @@ def run_chat(providers: dict[str, Provider], provider_name: str, model: str | No
                 print(f"error: {e}")
             continue
 
+        labelled = bool(agent.conversation.get("emoji"))
         try:
             agent.send(line)
+            if not labelled and agent.conversation.get("emoji"):
+                ui.notice(f"this conversation is now: {_label(agent.conversation)}")
         except ProviderError as e:
             ui.end_line()
             print(f"error: {e}")

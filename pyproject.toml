@@ -1,0 +1,18 @@
+[project]
+name = "private_ai"
+version = "0.1.0"
+description = "Personal use AI with local privacy enforced."
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.11"
+dependencies = []  # standard library only, on purpose: every dependency is a privacy and supply-chain risk
+
+[project.scripts]
+private-ai = "private_ai.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/private_ai"]

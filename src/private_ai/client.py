@@ -14,9 +14,13 @@ Privacy properties this module is responsible for:
 
 from __future__ import annotations
 
+import contextlib
+import http.client
 import json
 import urllib.error
 import urllib.request
+
+from collections.abc import Callable
 
 from private_ai import __version__
 from private_ai.providers import Provider
@@ -34,10 +38,9 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
 _opener = urllib.request.build_opener(_NoRedirect)
 
 
-def _request(
-    provider: Provider, path: str, body: dict | None = None, timeout: float = 30, url: str | None = None
-) -> dict:
-    url = url or provider.base_url + path
+@contextlib.contextmanager
+def _open(provider: Provider, url: str, body: dict | None, timeout: float):
+    """Open a request and translate every failure, including ones while reading."""
     headers = {"Accept": "application/json", "User-Agent": f"private_ai/{__version__}"}
     if provider.api_key:
         if not (url.startswith("https://") or provider.is_local):
@@ -51,9 +54,10 @@ def _request(
     req = urllib.request.Request(url, data=data, headers=headers)
     try:
         with _opener.open(req, timeout=timeout) as resp:
-            return json.load(resp)
+            yield resp
     except urllib.error.HTTPError as e:
         detail = e.read(2000).decode(errors="replace").strip()
+        e.close()
         raise ProviderError(f"HTTP {e.code} from {url}: {detail or e.reason}") from None
     except urllib.error.URLError as e:
         raise ProviderError(f"cannot reach {url}: {e.reason}") from None
@@ -61,6 +65,15 @@ def _request(
         raise ProviderError(f"timed out after {timeout:g}s: {url}") from None
     except json.JSONDecodeError:
         raise ProviderError(f"non-JSON response from {url}") from None
+    except (ConnectionError, http.client.HTTPException) as e:
+        raise ProviderError(f"connection to {url} failed: {e}") from None
+
+
+def _request(
+    provider: Provider, path: str, body: dict | None = None, timeout: float = 30, url: str | None = None
+) -> dict:
+    with _open(provider, url or provider.base_url + path, body, timeout) as resp:
+        return json.load(resp)
 
 
 def list_models(provider: Provider, timeout: float = 30) -> list[str]:
@@ -68,22 +81,23 @@ def list_models(provider: Provider, timeout: float = 30) -> list[str]:
     return [m["id"] for m in data.get("data", [])]
 
 
-def relayed_models(provider: Provider, timeout: float = 30) -> set[str]:
-    """Models on a local Ollama server that are actually run on a remote host.
+def relayed_models(provider: Provider, timeout: float = 30) -> dict[str, str]:
+    """Models on a local Ollama server that are actually run on a remote host,
+    mapped to the name the remote host knows them by.
 
     Uses Ollama's native model list, which is the only place this is reported.
-    Returns an empty set for servers that are not Ollama.
+    Returns nothing for servers that are not Ollama.
     """
     url = provider.base_url.removesuffix("/v1") + "/api/tags"
     try:
         data = _request(provider, "", timeout=timeout, url=url)
     except ProviderError:
-        return set()
-    return {m["name"] for m in data.get("models", []) if m.get("remote_host")}
+        return {}
+    return {m["name"]: m.get("remote_model") or m["name"] for m in data.get("models", []) if m.get("remote_host")}
 
 
-def _is_relayed(model: str, relayed: set[str]) -> bool:
-    return model in relayed or (":" not in model and f"{model}:latest" in relayed)
+def _relayed_as(model: str, relayed: dict[str, str]) -> str | None:
+    return relayed.get(model) or (relayed.get(f"{model}:latest") if ":" not in model else None)
 
 
 def local_models(provider: Provider, timeout: float = 30) -> list[str]:
@@ -91,8 +105,23 @@ def local_models(provider: Provider, timeout: float = 30) -> list[str]:
     models = list_models(provider, timeout)
     if provider.is_local:
         relayed = relayed_models(provider, timeout)
-        models = [m for m in models if not _is_relayed(m, relayed)]
+        models = [m for m in models if not _relayed_as(m, relayed)]
     return models
+
+
+def check_model(provider: Provider, model: str | None, timeout: float = 30) -> str:
+    """The model to use, after confirming a local provider would really run it locally."""
+    model = model or provider.model
+    if not model:
+        raise ProviderError(f"no model configured for provider '{provider.name}'")
+    remote_name = _relayed_as(model, relayed_models(provider, timeout)) if provider.is_local else None
+    if remote_name:
+        raise ProviderError(
+            f"'{model}' is a cloud model, but '{provider.name}' is the provider for models that run on this "
+            f"machine, and it only runs those. Pick a cloud provider instead; for Ollama's cloud that is: "
+            f"--provider ollama_cloud --model {remote_name}"
+        )
+    return model
 
 
 def chat(
@@ -103,14 +132,7 @@ def chat(
     timeout: float = 60,
 ) -> dict:
     """Send a chat completion and return the assistant message dict."""
-    model = model or provider.model
-    if not model:
-        raise ProviderError(f"no model configured for provider '{provider.name}'")
-    if provider.is_local and _is_relayed(model, relayed_models(provider, timeout)):
-        raise ProviderError(
-            f"'{model}' is not a local model: {provider.name} would relay it to a remote host. "
-            "Use a cloud provider entry for it instead."
-        )
+    model = check_model(provider, model, timeout)
     body: dict = {"model": model, "messages": messages, "stream": False}
     if max_tokens is not None:
         body["max_tokens"] = max_tokens
@@ -119,3 +141,62 @@ def chat(
         return data["choices"][0]["message"]
     except (KeyError, IndexError, TypeError):
         raise ProviderError(f"unexpected response shape: {json.dumps(data)[:300]}") from None
+
+
+def chat_stream(
+    provider: Provider,
+    messages: list[dict],
+    model: str | None = None,
+    tools: list[dict] | None = None,
+    on_text: Callable[[str], None] = lambda delta: None,
+    timeout: float = 300,
+) -> dict:
+    """Stream a chat completion. Calls on_text for each piece of the reply and
+    returns the complete assistant message, including any tool calls."""
+    model = check_model(provider, model, timeout)
+    body: dict = {"model": model, "messages": messages, "stream": True}
+    if tools:
+        body["tools"] = tools
+
+    text: list[str] = []
+    calls: list[dict] = []
+    slots: dict[int, dict] = {}  # stream index -> call being assembled
+    with _open(provider, provider.base_url + "/chat/completions", body, timeout) as resp:
+        for raw in resp:
+            line = raw.decode("utf-8", "replace").strip()
+            if not line.startswith("data:"):
+                continue
+            payload = line[5:].strip()
+            if payload == "[DONE]":
+                break
+            chunk = json.loads(payload)
+            if chunk.get("error"):
+                raise ProviderError(f"provider error mid-stream: {json.dumps(chunk['error'])[:300]}")
+            for choice in chunk.get("choices") or []:
+                delta = choice.get("delta") or {}
+                if delta.get("content"):
+                    text.append(delta["content"])
+                    on_text(delta["content"])
+                for part in delta.get("tool_calls") or []:
+                    index = part.get("index", 0)
+                    call = slots.get(index)
+                    # Some servers reuse index 0 for every call; a new id means a new call.
+                    if call is None or (part.get("id") and call["id"] and part["id"] != call["id"]):
+                        call = slots[index] = {"id": "", "name": "", "arguments": ""}
+                        calls.append(call)
+                    fn = part.get("function") or {}
+                    call["id"] = call["id"] or part.get("id") or ""
+                    call["name"] += fn.get("name") or ""
+                    call["arguments"] += fn.get("arguments") or ""
+
+    message: dict = {"role": "assistant", "content": "".join(text)}
+    if calls:
+        message["tool_calls"] = [
+            {
+                "id": c["id"] or f"call_{i}",
+                "type": "function",
+                "function": {"name": c["name"], "arguments": c["arguments"] or "{}"},
+            }
+            for i, c in enumerate(calls)
+        ]
+    return message

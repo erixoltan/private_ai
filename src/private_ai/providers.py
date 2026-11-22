@@ -8,6 +8,7 @@ Configuration lives only on this machine:
 
     ~/.config/private_ai/config.toml     (or $PRIVATE_AI_CONFIG)
 
+    default_provider = "fireworks"       # used by `private-ai chat`; default is local ollama
     FIREWORKS_API_KEY = "fw_..."         # simplest: same names as the environment variables
 
     [providers.fireworks]
@@ -112,6 +113,14 @@ def config_warnings(path: Path | None = None) -> list[str]:
         if path.stat().st_mode & (stat.S_IRWXG | stat.S_IRWXO):
             return [f"{path} is readable by other users; run: chmod 600 {path}"]
     return []
+
+
+def default_provider_name(path: Path | None = None) -> str:
+    path = path or config_path()
+    if path.exists():
+        with path.open("rb") as f:
+            return tomllib.load(f).get("default_provider", "ollama")
+    return "ollama"
 
 
 def load_providers(path: Path | None = None) -> dict[str, Provider]:

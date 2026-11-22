@@ -66,7 +66,7 @@ class ClientTest(unittest.TestCase):
 
     def test_relayed_model_refused_on_local_provider(self):
         for name in ("m2", "m2:latest"):
-            with self.assertRaisesRegex(ProviderError, "not a local model"):
+            with self.assertRaisesRegex(ProviderError, "is a cloud model"):
                 chat(self.provider(), [], model=name)
         self.assertEqual(local_models(self.provider()), ["m1"])
 

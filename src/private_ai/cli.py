@@ -1,4 +1,4 @@
-"""Command line: list providers and run connectivity checks."""
+"""Command line: chat with the agent, list providers, run connectivity checks."""
 
 from __future__ import annotations
 
@@ -7,7 +7,7 @@ import sys
 import time
 
 from private_ai.client import ProviderError, chat, local_models
-from private_ai.providers import Provider, config_path, config_warnings, load_providers
+from private_ai.providers import Provider, config_path, config_warnings, default_provider_name, load_providers
 
 PING = [{"role": "user", "content": "Reply with the single word: pong"}]
 
@@ -49,6 +49,12 @@ def check(provider: Provider, model: str | None, timeout: float) -> bool:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="private-ai", description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
+    p_chat = sub.add_parser("chat", help="talk to the agent in this terminal")
+    p_chat.add_argument("--provider", help="provider to use (default: default_provider in config, else local ollama)")
+    p_chat.add_argument("--model", help="model to use (overrides config)")
+    p_chat.add_argument(
+        "--resume", nargs="?", const="latest", metavar="ID", help="continue the latest conversation, or the one with this id"
+    )
     sub.add_parser("providers", help="show configured providers and their data policies")
     p_check = sub.add_parser("check", help="test connectivity to providers")
     p_check.add_argument("names", nargs="*", help="providers to check (default: all)")
@@ -63,6 +69,11 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     for warning in config_warnings():
         print(f"warning: {warning}", file=sys.stderr)
+
+    if args.command == "chat":
+        from private_ai.terminal import run_chat
+
+        return run_chat(providers, args.provider or default_provider_name(), args.model, args.resume)
 
     if args.command == "providers":
         for p in providers.values():

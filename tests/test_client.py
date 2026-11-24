@@ -102,6 +102,7 @@ class ConfigTest(unittest.TestCase):
             path = Path(d) / "config.toml"
             path.write_text(
                 'FIREWORKS_API_KEY = "k"\n'
+                'BEDROCK_API_KEY = "b"\n'
                 '[providers.fireworks]\nmodel = "x"\n'
                 '[providers.bedrock]\nregion = "eu-west-1"\n'
                 '[providers.mine]\nbase_url = "http://localhost:9/v1/"\n'
@@ -111,7 +112,29 @@ class ConfigTest(unittest.TestCase):
         if "FIREWORKS_API_KEY" not in os.environ:
             self.assertEqual(providers["fireworks"].api_key, "k")
         self.assertIn("eu-west-1", providers["bedrock"].base_url)
+        if "AWS_BEARER_TOKEN_BEDROCK" not in os.environ:
+            self.assertEqual(providers["bedrock"].api_key, "b")
         self.assertEqual(providers["mine"].base_url, "http://localhost:9/v1")
+
+    def test_bedrock_model_names(self):
+        from private_ai.client import bedrock_model_ids
+
+        arn = "arn:aws:bedrock:us-east-2::foundation-model/"
+        foundation = {
+            "modelSummaries": [
+                {"modelId": "zai.glm-5", "inferenceTypesSupported": ["ON_DEMAND"]},
+                {"modelId": "zai.glm-5.3", "inferenceTypesSupported": ["INFERENCE_PROFILE"]},
+            ]
+        }
+        profiles = {
+            "inferenceProfileSummaries": [
+                {"inferenceProfileId": "us.zai.glm-5.3", "models": [{"modelArn": arn + "zai.glm-5.3"}]},
+                {"inferenceProfileId": "global.zai.glm-5.3", "models": [{"modelArn": arn + "zai.glm-5.3"}]},
+                {"inferenceProfileId": "us.cohere.embed-v4:0", "models": [{"modelArn": arn + "cohere.embed-v4:0"}]},
+            ]
+        }
+        # In-Region models and geographic profiles; no worldwide profiles, no non-text models.
+        self.assertEqual(bedrock_model_ids(foundation, profiles), ["zai.glm-5", "us.zai.glm-5.3"])
 
 
 if __name__ == "__main__":

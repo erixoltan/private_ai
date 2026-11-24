@@ -9,6 +9,7 @@ import time
 import unicodedata
 from collections.abc import Callable
 
+from private_ai import research, search
 from private_ai.agent import Agent, pick_model, ready
 from private_ai.client import ProviderError
 from private_ai.providers import Provider
@@ -30,6 +31,10 @@ HELP = """\
 /forget TEXT         delete remembered facts containing TEXT
 /provider NAME [MODEL]   switch provider (keeps the conversation)
 /model NAME          switch model
+/search [NAME]       show the web search services, or switch to one
+/research            list saved research; /research N prints report N
+/research plan N     print the plan (outline and reasoning) behind report N
+/research TOPIC      research a topic on the web and save a report
 /quit                leave (Ctrl-D also works)"""
 
 
@@ -153,6 +158,16 @@ def _banner(agent: Agent) -> None:
     print(f"{p.name} ({where}) · {agent.model}")
     if not p.is_local and p.policy_note:
         print(f"  {p.policy_note} Not verified by this program: {p.policy_url}")
+    _search_line()
+
+
+def _search_line() -> None:
+    try:
+        s = search.current()
+    except ValueError as e:
+        print(f"web search: {e}")
+        return
+    print(f"web search: {s.name}. You are asked before each query is sent to {s.destination}.")
 
 
 def _label(conversation: dict) -> str:
@@ -271,6 +286,38 @@ def run_chat(providers: dict[str, Provider], provider_name: str, model: str | No
                     new = ready(providers[name])
                     agent = Agent(new, pick_model(new, new_model.strip() or None), store, ui, agent.conversation)
                     _banner(agent)
+                elif command == "/research":
+                    jobs = store.list_research()
+                    if not arg:
+                        print("\n".join(f"{n:>2}. {research.summary_line(j)}" for n, j in enumerate(jobs, 1)) or "No research yet.")
+                    elif arg.removeprefix("plan ").strip().isdigit():
+                        number = int(arg.removeprefix("plan "))
+                        if not 0 < number <= len(jobs):
+                            raise ValueError("no such research; see /research")
+                        job = jobs[number - 1]
+                        if arg.startswith("plan"):
+                            print(job.get("outline") or "(no plan was written)")
+                        else:
+                            print(job["report"] or f"(no report: {job.get('error') or research.status(job)})")
+                    else:
+                        backend = search.current()
+                        print(research.describe(backend))
+                        try:
+                            job = research.Research(agent.provider, agent.model, store, backend, ui.notice).run(arg)
+                        except KeyboardInterrupt:
+                            print("(stopped; what was gathered is saved)")
+                            continue
+                        print("\n" + job["report"] if job["status"] == "done" else f"error: {job.get('error') or job['status']}")
+                        print(ui._dim("(saved; the assistant can use it in any conversation)"))
+                elif command == "/search":
+                    if arg:
+                        search.select(arg)
+                        _search_line()
+                    else:
+                        using = search.current().name
+                        for s in search.load_backends().values():
+                            state = "in use" if s.name == using else ("ready" if s.ready else f"needs {s.key_env}")
+                            print(f"  {s.name:<10} {state:<22} {s.policy_note}")
                 elif command == "/model":
                     if not arg:
                         raise ValueError("usage: /model NAME")

@@ -10,13 +10,14 @@ Configuration lives only on this machine:
 
     default_provider = "fireworks"       # used by `private-ai chat`; default is local ollama
     FIREWORKS_API_KEY = "fw_..."         # simplest: same names as the environment variables
+    BEDROCK_API_KEY = "..."              # or AWS_BEARER_TOKEN_BEDROCK, the name AWS uses
 
     [providers.fireworks]
     model = "accounts/fireworks/models/..."
     context_tokens = 100000              # conversation size before older parts are summarised
 
     [providers.bedrock]
-    region = "us-west-2"
+    region = "us-east-2"                 # must be the Region the key was created in
 
     [providers.my_server]                # any OpenAI-compatible endpoint
     base_url = "http://localhost:8080/v1"
@@ -41,6 +42,7 @@ class Provider:
     name: str
     base_url: str
     key_env: str | None = None  # environment variable holding the API key
+    key_aliases: tuple[str, ...] = ()  # other names the same key is accepted under
     api_key: str | None = None
     model: str | None = None  # None: use the first model the endpoint lists
     # How much conversation to send before the earlier part is replaced by a
@@ -94,10 +96,19 @@ def _builtin(bedrock_region: str) -> dict[str, Provider]:
         ),
         Provider(
             name="bedrock",
+            # bedrock-runtime rather than bedrock-mantle: only it accepts the
+            # cross-Region inference profiles (us.zai.glm-5.3, ...) that newer models require.
             base_url=f"https://bedrock-runtime.{bedrock_region}.amazonaws.com/openai/v1",
-            key_env="AWS_BEARER_TOKEN_BEDROCK",
+            key_env="AWS_BEARER_TOKEN_BEDROCK",  # the name AWS's own tools use
+            key_aliases=("BEDROCK_API_KEY",),
+            # An open-weights model: AWS keeps prompts for up to 30 days for some
+            # OpenAI and Anthropic models, so "first listed" is not a safe default.
+            model="zai.glm-5",
             policy_url="https://docs.aws.amazon.com/bedrock/latest/userguide/data-protection.html",
-            policy_note="Provider states it does not store prompts or use them for training.",
+            policy_note=(
+                "Provider states it does not train on prompts or share them with model makers. "
+                "It may keep them up to 30 days for some OpenAI and Anthropic models."
+            ),
         ),
     ]
     return {p.name: p for p in providers}
@@ -156,6 +167,7 @@ def load_providers(path: Path | None = None) -> dict[str, Provider]:
 
     for name, p in providers.items():
         # Key lookup order: environment, top-level NAME = "..." in the file, then api_key.
-        named_key = (os.environ.get(p.key_env) or config.get(p.key_env)) if p.key_env else None
+        names = ((p.key_env,) if p.key_env else ()) + p.key_aliases
+        named_key = next((v for n in names for v in (os.environ.get(n), config.get(n)) if v), None)
         providers[name] = replace(p, base_url=p.base_url.rstrip("/"), api_key=named_key or p.api_key)
     return providers

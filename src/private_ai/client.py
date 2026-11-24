@@ -17,6 +17,7 @@ from __future__ import annotations
 import contextlib
 import http.client
 import json
+import re
 import urllib.error
 import urllib.request
 
@@ -39,13 +40,15 @@ _opener = urllib.request.build_opener(_NoRedirect)
 
 
 @contextlib.contextmanager
-def _open(provider: Provider, url: str, body: dict | None, timeout: float):
-    """Open a request and translate every failure, including ones while reading."""
+def _open(provider, url: str, body: dict | None, timeout: float, key_header: str = "Authorization"):
+    """Open a request and translate every failure, including ones while reading.
+
+    provider is anything with api_key and is_local: a model provider or a search backend."""
     headers = {"Accept": "application/json", "User-Agent": f"private_ai/{__version__}"}
     if provider.api_key:
         if not (url.startswith("https://") or provider.is_local):
             raise ProviderError("refusing to send an API key over unencrypted HTTP")
-        headers["Authorization"] = f"Bearer {provider.api_key}"
+        headers[key_header] = f"Bearer {provider.api_key}" if key_header == "Authorization" else provider.api_key
     data = None
     if body is not None:
         data = json.dumps(body).encode()
@@ -70,15 +73,51 @@ def _open(provider: Provider, url: str, body: dict | None, timeout: float):
 
 
 def _request(
-    provider: Provider, path: str, body: dict | None = None, timeout: float = 30, url: str | None = None
+    provider,
+    path: str,
+    body: dict | None = None,
+    timeout: float = 30,
+    url: str | None = None,
+    key_header: str = "Authorization",
 ) -> dict:
-    with _open(provider, url or provider.base_url + path, body, timeout) as resp:
+    with _open(provider, url or provider.base_url + path, body, timeout, key_header) as resp:
         return json.load(resp)
 
 
 def list_models(provider: Provider, timeout: float = 30) -> list[str]:
+    bedrock = _BEDROCK_RUNTIME.match(provider.base_url)
+    if bedrock:
+        return _bedrock_models(provider, f"https://bedrock.{bedrock[1]}.amazonaws.com", timeout)
     data = _request(provider, "/models", timeout=timeout)
     return [m["id"] for m in data.get("data", [])]
+
+
+# Amazon Bedrock's runtime endpoint has no model list; its management endpoint does.
+_BEDROCK_RUNTIME = re.compile(r"https://bedrock-runtime\.([a-z0-9-]+)\.amazonaws\.com/")
+
+
+def _bedrock_models(provider: Provider, management_url: str, timeout: float) -> list[str]:
+    foundation = _request(provider, "", timeout=timeout, url=management_url + "/foundation-models?byOutputModality=TEXT")
+    profiles = _request(provider, "", timeout=timeout, url=management_url + "/inference-profiles?maxResults=1000")
+    return bedrock_model_ids(foundation, profiles)
+
+
+def bedrock_model_ids(foundation: dict, profiles: dict) -> list[str]:
+    """The names a Bedrock request can use: models that run in the account's
+    own Region, then cross-Region inference profiles for text models.
+
+    Global profiles are left out: they may process a request in any Region in
+    the world. A profile tied to a geography (us., eu., ...) stays inside it.
+    A global profile still works if the user types its name."""
+    summaries = foundation.get("modelSummaries", [])
+    ids = [m["modelId"] for m in summaries if "ON_DEMAND" in m.get("inferenceTypesSupported", [])]
+    text_models = {m["modelId"] for m in summaries}
+    for profile in profiles.get("inferenceProfileSummaries", []):
+        name = profile["inferenceProfileId"]
+        runs = {m.get("modelArn", "").rpartition("/")[2] for m in profile.get("models", [])}
+        if not name.startswith("global.") and runs & text_models:
+            ids.append(name)
+    return ids
 
 
 def relayed_models(provider: Provider, timeout: float = 30) -> dict[str, str]:
@@ -130,15 +169,27 @@ def chat(
     model: str | None = None,
     max_tokens: int | None = None,
     timeout: float = 60,
+    reasoning_effort: str | None = None,
 ) -> dict:
-    """Send a chat completion and return the assistant message dict."""
+    """Send a chat completion and return the assistant message dict, with the
+    reason the model stopped under "finish_reason" ("length": it ran out of max_tokens).
+
+    reasoning_effort ("low" or "high") asks a thinking model to think less or
+    more. It is a request: a provider or model that rejects it is asked again without it."""
     model = check_model(provider, model, timeout)
     body: dict = {"model": model, "messages": messages, "stream": False}
     if max_tokens is not None:
         body["max_tokens"] = max_tokens
-    data = _request(provider, "/chat/completions", body, timeout=timeout)
     try:
-        return data["choices"][0]["message"]
+        asked = {**body, "reasoning_effort": reasoning_effort}
+        data = _request(provider, "/chat/completions", asked, timeout=timeout) if reasoning_effort else None
+    except ProviderError as e:
+        if "HTTP 400" not in str(e) and "HTTP 422" not in str(e):
+            raise
+        data = None
+    data = data or _request(provider, "/chat/completions", body, timeout=timeout)
+    try:
+        return {**data["choices"][0]["message"], "finish_reason": data["choices"][0].get("finish_reason")}
     except (KeyError, IndexError, TypeError):
         raise ProviderError(f"unexpected response shape: {json.dumps(data)[:300]}") from None
 

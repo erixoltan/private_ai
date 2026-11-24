@@ -6,6 +6,7 @@ import argparse
 import sys
 import time
 
+from private_ai import research, search
 from private_ai.client import ProviderError, chat, local_models
 from private_ai.providers import Provider, config_path, config_warnings, default_provider_name, load_providers
 
@@ -46,6 +47,58 @@ def check(provider: Provider, model: str | None, timeout: float) -> bool:
     return True
 
 
+def run_research(providers: dict[str, Provider], args) -> int:
+    from private_ai.agent import pick_model, ready
+    from private_ai.store import Store
+
+    store = Store()
+    jobs = store.list_research()
+    chosen = args.show or args.plan or args.retry
+    job = None
+    if chosen:
+        job = jobs[int(chosen) - 1] if chosen.isdigit() and 0 < int(chosen) <= len(jobs) else None
+        job = job or next((j for j in jobs if j["id"] == chosen), None)
+        if not job:
+            print("error: no such research; see --list", file=sys.stderr)
+            return 1
+    if args.show:
+        print(job["report"] or f"(no report: {job.get('error') or research.status(job)})")
+        return 0
+    if args.plan:
+        print(job.get("outline") or "(no plan was written)")
+        return 0
+    if args.retry and (job["report"] or not job.get("gathered")):
+        print("error: only research that finished reading but has no report can be retried", file=sys.stderr)
+        return 1
+    if args.list or not (args.topic or job):
+        print("\n".join(f"{n:>2}. {research.summary_line(j)}" for n, j in enumerate(jobs, 1)) or "No research yet.")
+        return 0
+    try:
+        provider = ready(providers[args.provider or default_provider_name()])
+        model = pick_model(provider, args.model)
+        backend = search.current()
+    except (KeyError, ValueError, ProviderError) as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 1
+    print(f"{provider.name} ({'local' if provider.is_local else 'cloud'}) · {model}")
+    if not job:
+        print(research.describe(backend, args.searches, args.pages) + "\n")
+    runner = research.Research(
+        provider, model, store, backend, lambda m: print(f"  [{m}]", file=sys.stderr), searches=args.searches, pages=args.pages
+    )
+    try:
+        job = runner.run(job["topic"] if job else args.topic, job)
+    except KeyboardInterrupt:
+        print("\n(stopped; what was gathered is saved)", file=sys.stderr)
+        return 130
+    if job["status"] != "done":
+        print(f"error: {job.get('error') or job['status']}", file=sys.stderr)
+        return 1
+    print("\n" + job["report"])
+    print(f"\nSaved in {store.research / (job['id'] + '.json')}", file=sys.stderr)
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="private-ai", description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
@@ -64,7 +117,20 @@ def main(argv: list[str] | None = None) -> int:
         metavar="SECONDS",
         help="how long a reply may keep going after its browser tab is closed (default: 120)",
     )
-    sub.add_parser("providers", help="show configured providers and their data policies")
+    sub.add_parser("providers", help="show configured providers and search services, and their data policies")
+    p_research = sub.add_parser("research", help="research a topic on the web and save a report with sources")
+    p_research.add_argument("topic", nargs="?", help="the question to research")
+    p_research.add_argument("--list", action="store_true", help="list saved research")
+    p_research.add_argument("--show", metavar="N", help="print report N from --list (or its id)")
+    p_research.add_argument("--plan", metavar="N", help="print the plan (outline and reasoning) behind report N")
+    p_research.add_argument("--retry", metavar="N", help="write the report again for research N whose reading was done")
+    p_research.add_argument("--provider", help="provider to use (default: default_provider in config, else local ollama)")
+    p_research.add_argument("--model", help="model to use (overrides config)")
+    p_research.add_argument("--searches", type=int, default=research.DEFAULT_SEARCHES, help="most searches to send")
+    p_research.add_argument("--pages", type=int, default=research.DEFAULT_PAGES, help="most pages to read")
+    p_search = sub.add_parser("search", help="run one web search and print the results (a test of a search service)")
+    p_search.add_argument("query")
+    p_search.add_argument("--with", dest="backend", metavar="NAME", help="search service to use (default: the one chat uses)")
     p_check = sub.add_parser("check", help="test connectivity to providers")
     p_check.add_argument("names", nargs="*", help="providers to check (default: all)")
     p_check.add_argument("--model", help="model to test with (overrides config)")
@@ -97,6 +163,27 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"  policy: {p.policy_note}")
             if p.policy_url:
                 print(f"          {p.policy_url}")
+        using = search.default_backend_name()
+        print("\nweb search")
+        for s in search.load_backends().values():
+            key = "not needed" if not s.key_env else ("set" if s.api_key else f"missing ({s.key_env})")
+            print(f"{s.name}{'  (default)' if s.name == using else ''}\n  url:    {s.base_url}\n  key:    {key}")
+            print(f"  policy: {s.policy_note}\n          {s.policy_url}")
+        return 0
+
+    if args.command == "research":
+        return run_research(providers, args)
+
+    if args.command == "search":
+        try:
+            backend = search.select(args.backend) if args.backend else search.current()
+            results = search.search(backend, args.query)
+        except (ValueError, ProviderError) as e:
+            print(f"error: {e}", file=sys.stderr)
+            return 1
+        print(f"{backend.name}: {len(results)} results")
+        for r in results:
+            print(f"\n{r['title']}  {r['date']}\n  {r['url']}\n  {r['snippet'][:200]}")
         return 0
 
     unknown = [n for n in args.names if n not in providers]

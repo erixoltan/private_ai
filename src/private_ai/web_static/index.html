@@ -9,7 +9,9 @@
 <body>
 <aside id="sidebar">
   <button id="new" type="button">New conversation</button>
-  <ul id="conversations"></ul>
+  <ul id="conversations" class="items"></ul>
+  <button id="research-open" type="button">New research</button>
+  <ul id="research-list" class="items"></ul>
   <button id="memory-open" type="button" class="quiet">Memory</button>
 </aside>
 <main>
@@ -17,10 +19,17 @@
     <button id="menu" type="button" class="quiet" aria-label="Conversations">&#9776;</button>
     <label>Provider <select id="provider"></select></label>
     <label>Model <select id="model"></select></label>
+    <label>Web search <select id="search"></select></label>
     <p id="policy"></p>
+    <p id="search-policy"></p>
   </header>
   <div id="title-bar"><span id="title-emoji"></span><h1 id="title"></h1></div>
   <section id="transcript" aria-live="polite"></section>
+  <section id="research-view" hidden>
+    <p id="research-question"></p>
+    <div id="research-actions"></div>
+    <pre id="research-report"></pre>
+  </section>
   <form id="composer">
     <textarea id="input" rows="2" placeholder="Message (Enter to send, Shift+Enter for a new line)"></textarea>
     <button id="send" type="submit">Send</button>
@@ -32,6 +41,17 @@
   <p class="hint">Given to the model at the start of every conversation.</p>
   <ul id="facts"></ul>
   <button id="memory-close" type="button">Close</button>
+</dialog>
+<dialog id="research">
+  <h2>New research</h2>
+  <p class="hint">The research agent searches, reads and writes a report with its sources. It keeps working while you
+    do other things, for as long as this program is running.</p>
+  <form id="research-form">
+    <textarea id="research-topic" rows="3" placeholder="What should be researched? State it fully."></textarea>
+    <button type="submit">Start</button>
+  </form>
+  <p class="hint" id="research-allows"></p>
+  <button id="research-close" type="button">Cancel</button>
 </dialog>
 <dialog id="move">
   <h2>Move this exchange to&hellip;</h2>

@@ -3,12 +3,15 @@
     ~/.local/share/private_ai/           (or $PRIVATE_AI_DATA)
         memory.md                        one remembered fact per line; edit freely
         conversations/<id>.json          one file per conversation
+        pages/<hash>.json                web pages the agent has read, with address and date
+        research/<id>.json               research reports, with their notes and sources
 
 Files are created readable only by the user.
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -40,6 +43,10 @@ class Store:
         self.conversations = self.root / "conversations"
         self.root.mkdir(parents=True, exist_ok=True, mode=0o700)
         self.conversations.mkdir(exist_ok=True, mode=0o700)
+        self.pages = self.root / "pages"
+        self.pages.mkdir(exist_ok=True, mode=0o700)
+        self.research = self.root / "research"
+        self.research.mkdir(exist_ok=True, mode=0o700)
         self.memory_path = self.root / "memory.md"
 
     # ---- conversations ----
@@ -173,3 +180,103 @@ class Store:
 
     def _write_memory(self, facts: list[str]) -> None:
         _write_private(self.memory_path, "".join(f"- {f}\n" for f in facts))
+
+    # ---- web pages the agent has read ----
+
+    def _page_path(self, url: str) -> Path:
+        return self.pages / (hashlib.sha256(url.encode()).hexdigest()[:20] + ".json")
+
+    def save_page(self, url: str, title: str, text: str) -> None:
+        """Keep the latest copy of a page, so it can be found and reread later."""
+        page = {"url": url, "title": title, "fetched": time.time(), "text": text}
+        _write_private(self._page_path(url), json.dumps(page, indent=1, ensure_ascii=False))
+
+    def load_page(self, url: str) -> dict | None:
+        try:
+            return json.loads(self._page_path(url).read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return None
+
+    def search_pages(self, query: str, limit: int = 6) -> list[dict]:
+        """Keyword search over saved pages: url, title, date and an excerpt around the first match."""
+        words = [w for w in re.findall(r"\w+", query.lower()) if len(w) > 2]
+        hits = []
+        for path in self.pages.glob("*.json") if words else []:
+            try:
+                page = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                continue
+            lower = f"{page['title']}\n{page['text']}".lower()
+            score = sum(w in lower for w in words)
+            if score:
+                at = max(0, min(page["text"].lower().find(w) for w in words if w in lower) - 200)
+                hits.append(
+                    {
+                        "score": score,
+                        "fetched": page["fetched"],
+                        "url": page["url"],
+                        "title": page["title"],
+                        "date": time.strftime("%Y-%m-%d", time.localtime(page["fetched"])),
+                        "excerpt": page["text"][at : at + 800],
+                    }
+                )
+        hits.sort(key=lambda h: (h["score"], h["fetched"]), reverse=True)
+        return hits[:limit]
+
+    # ---- research reports ----
+
+    def new_research(self, topic: str) -> dict:
+        now = time.time()
+        stamp = time.strftime("%Y%m%d-%H%M%S", time.localtime(now))
+        return {
+            "id": f"{stamp}-{secrets.token_hex(2)}",
+            "topic": topic,
+            "status": "running",  # then done, failed or stopped
+            "created": now,
+            "finished": None,
+            "queries": [],
+            "sources": [],  # n, url, title, date, notes
+            "unread": [],  # pages that refused: url, title, problem
+            "log": [],
+            "outline": "",  # the plan for the report: sections, points and the reasoning behind them
+            "report": "",
+        }
+
+    def _research_path(self, research_id: str) -> Path:
+        if not re.fullmatch(r"[\w-]+", research_id):
+            raise ValueError("bad research id")
+        return self.research / f"{research_id}.json"
+
+    def save_research(self, job: dict) -> None:
+        job["updated"] = time.time()
+        _write_private(self._research_path(job["id"]), json.dumps(job, indent=1, ensure_ascii=False))
+
+    def load_research(self, research_id: str) -> dict:
+        return json.loads(self._research_path(research_id).read_text(encoding="utf-8"))
+
+    def delete_research(self, research_id: str) -> None:
+        self._research_path(research_id).unlink(missing_ok=True)
+
+    def list_research(self) -> list[dict]:
+        """All research jobs, newest first."""
+        found = []
+        for path in self.research.glob("*.json"):
+            try:
+                found.append(json.loads(path.read_text(encoding="utf-8")))
+            except (OSError, json.JSONDecodeError):
+                continue
+        return sorted(found, key=lambda j: j["created"], reverse=True)
+
+    def search_research(self, query: str, limit: int = 2) -> list[dict]:
+        """Finished reports that mention the query's words, best match first."""
+        words = [w for w in re.findall(r"\w+", query.lower()) if len(w) > 2]
+        scored = []
+        for job in self.list_research():
+            if job["status"] != "done":
+                continue
+            topic, report = job["topic"].lower(), job["report"].lower()
+            score = sum(3 * (w in topic) + (w in report) for w in words)
+            if score:
+                scored.append((score, job["created"], job))
+        scored.sort(key=lambda s: s[:2], reverse=True)
+        return [job for _, _, job in scored[:limit]]

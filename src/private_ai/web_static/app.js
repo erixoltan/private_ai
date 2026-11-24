@@ -144,6 +144,7 @@ async function follow(conversationId) {
     lastBlock = null;
     setRunning(false);
     refreshList();
+    refreshResearch(); // the reply may have started some
   }
 }
 
@@ -158,7 +159,7 @@ async function refreshList() {
     const item = el("li", c.id === current ? "current" : "");
     item.dataset.id = c.id;
     if (c.color) item.dataset.color = c.color;
-    if (c.id === current) showIdentity(c);
+    if (c.id === current && !researchShown) showIdentity(c);
     item.append(el("span", "emoji", c.emoji || ""));
     const open = el("button", "open");
     open.type = "button";
@@ -194,6 +195,7 @@ function setCurrent(id) {
 function newConversation() {
   follower?.abort();
   follower = null;
+  showResearchView(false);
   setCurrent(null);
   showIdentity(null);
   setRunning(false);
@@ -206,6 +208,7 @@ async function openConversation(id) {
   follower?.abort();
   follower = null;
   setRunning(false);
+  showResearchView(false);
   let conversation;
   try {
     conversation = await api(`/api/conversations/${id}`);
@@ -349,6 +352,178 @@ function fillProviders(state) {
   select.value = (preferred || state.providers.find((p) => p.ready) || {}).name || "";
 }
 
+// ---- web search ----
+
+function fillSearch(search) {
+  const select = $("search");
+  select.replaceChildren();
+  for (const s of search.services) {
+    const option = el("option", "", s.name + (s.local ? " (local)" : "") + (s.ready ? "" : " — no API key"));
+    option.value = s.name;
+    option.disabled = !s.ready;
+    select.append(option);
+  }
+  select.value = search.using;
+  const line = $("search-policy");
+  line.replaceChildren();
+  const s = search.services.find((x) => x.name === search.using);
+  if (!s) return;
+  line.append("Web search: you are asked before each query is sent. " + (s.note || "") + " ");
+  if (s.url) {
+    const link = el("a", "", "Read more");
+    link.href = s.url;
+    link.target = "_blank";
+    link.rel = "noopener noreferrer";
+    line.append(link);
+  }
+}
+$("search").onchange = async () => {
+  fillSearch(await post("/api/search", { name: $("search").value }));
+};
+
+// ---- research ----
+// Jobs run on the server and are listed in the side panel under the
+// conversations. Opening one puts its report where the transcript would be.
+
+let researchShown = null; // id of the job on screen, or null while a conversation is
+let researchTimer = null;
+let researchDrawn = ""; // what the job on screen looked like when last drawn
+
+function showResearchView(on) {
+  $("research-view").hidden = !on;
+  $("transcript").hidden = on;
+  $("composer").hidden = on;
+  if (!on) researchShown = null;
+  for (const item of $("research-list").children) item.classList.toggle("current", on && item.dataset.id === researchShown);
+}
+async function openResearch(id) {
+  follower?.abort();
+  follower = null;
+  setRunning(false);
+  setCurrent(null);
+  researchShown = id;
+  researchDrawn = "";
+  showResearchView(true);
+  history.replaceState(null, "", "#research:" + id);
+  document.body.classList.remove("menu-open");
+  $("research-actions").replaceChildren();
+  $("research-report").textContent = "";
+  await refreshResearch();
+}
+async function drawResearch(id) {
+  let job;
+  try {
+    job = await api("/api/research/" + id);
+  } catch (error) {
+    if (researchShown === id) newConversation();
+    return;
+  }
+  if (researchShown !== id) return;
+  showIdentity({ title: job.title || job.topic, emoji: job.emoji, color: job.color });
+  $("research-question").textContent = job.title ? job.topic : "";
+  const actions = $("research-actions");
+  actions.replaceChildren();
+  const button = (label, action) => {
+    const b = el("button", "", label);
+    b.type = "button";
+    b.onclick = action;
+    actions.append(b);
+    return b;
+  };
+  if (job.status === "running") {
+    button("Stop", async () => {
+      await post(`/api/research/${id}/stop`);
+      refreshResearch();
+    });
+  } else {
+    if (job.report) button("Copy report", () => navigator.clipboard.writeText(job.report));
+    if (job.report && job.outline) {
+      // The plan is the thinking behind the report: its outline and the reasoning for each section.
+      const toggle = button("Show the plan", () => {
+        const showingPlan = toggle.textContent === "Show the report";
+        $("research-report").textContent = showingPlan ? job.report : job.outline;
+        toggle.textContent = showingPlan ? "Show the plan" : "Show the report";
+      });
+    }
+    if (!job.report && job.gathered) {
+      // The reading was done and only the writing failed: no searching is repeated.
+      button("Write the report again", async () => {
+        await post("/api/research", { retry: id, provider: $("provider").value, model: $("model").value });
+        refreshResearch();
+      });
+    }
+  }
+  const progress = job.log.map((line) => "· " + line).join("\n");
+  const failed = job.status === "failed" ? `\n\nThis research failed: ${job.error}` : "";
+  $("research-report").textContent = job.report || progress + failed;
+}
+async function refreshResearch() {
+  const data = await api("/api/research");
+  $("research-allows").textContent = data.allows;
+  const list = $("research-list");
+  list.replaceChildren();
+  if (!data.jobs.length) list.append(el("li", "none", "No research yet."));
+  for (const job of data.jobs) {
+    const item = el("li", job.id === researchShown ? "current" : "");
+    item.dataset.id = job.id;
+    if (job.color) item.dataset.color = job.color;
+    item.append(el("span", "emoji", job.emoji || ""));
+    const open = el("button", "open");
+    open.type = "button";
+    open.title = job.topic;
+    open.append(el("span", "title", job.title));
+    const when = new Date(job.created * 1000).toLocaleString([], { dateStyle: "medium", timeStyle: "short" });
+    const line = job.status === "running" ? job.last || "starting…" : job.status === "done" ? when : `${job.status} · ${when}`;
+    open.append(el("span", "date " + job.status, line));
+    open.onclick = () => openResearch(job.id);
+    const remove = el("button", "delete", "×");
+    remove.type = "button";
+    remove.title = "Delete this research";
+    remove.onclick = () => deleteResearch(job);
+    item.append(open, remove);
+    list.append(item);
+  }
+  const shown = data.jobs.find((job) => job.id === researchShown);
+  if (researchShown && !shown) newConversation();
+  // Drawn again only when something changed, so a plan being read is not swapped back to the report.
+  const looks = shown ? [shown.status, shown.last, shown.title, shown.color].join("|") : "";
+  if (shown && looks !== researchDrawn) {
+    researchDrawn = looks;
+    await drawResearch(shown.id);
+  }
+  clearTimeout(researchTimer);
+  if (data.jobs.some((job) => job.status === "running")) researchTimer = setTimeout(refreshResearch, 2500);
+}
+async function deleteResearch(job) {
+  if (!confirm(`Permanently delete the research "${job.title}"?`)) return;
+  try {
+    await api("/api/research/" + job.id, { method: "DELETE" });
+  } catch (error) {
+    alert(error.message);
+    return;
+  }
+  if (job.id === researchShown) newConversation();
+  else refreshResearch();
+}
+$("research-open").onclick = () => {
+  $("research").showModal();
+  refreshResearch();
+};
+$("research-close").onclick = () => $("research").close();
+$("research-form").onsubmit = async (event) => {
+  event.preventDefault();
+  const topic = $("research-topic").value.trim();
+  if (!topic) return;
+  try {
+    const started = await post("/api/research", { topic, provider: $("provider").value, model: $("model").value });
+    $("research-topic").value = "";
+    $("research").close();
+    await openResearch(started.id);
+  } catch (error) {
+    $("research-allows").textContent = "Could not start: " + error.message;
+  }
+};
+
 // ---- memory ----
 
 async function showMemory(facts) {
@@ -452,9 +627,12 @@ $("provider").onchange = () => {
   showIdentity(null);
   const state = await refreshList();
   fillProviders(state);
+  fillSearch(state.search);
   showPolicy();
   fitInput();
   await loadModels();
-  if (location.hash.length > 1) await openConversation(location.hash.slice(1));
+  await refreshResearch();
+  if (location.hash.startsWith("#research:")) await openResearch(location.hash.slice(10));
+  else if (location.hash.length > 1) await openConversation(location.hash.slice(1));
   $("input").focus();
 })();

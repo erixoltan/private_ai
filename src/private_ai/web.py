@@ -28,6 +28,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
+from private_ai import research, search
 from private_ai.agent import Agent, pick_model, ready
 from private_ai.client import ProviderError, local_models
 from private_ai.providers import Provider
@@ -164,6 +165,7 @@ class App:
         self.lock = threading.Lock()
         self.agents: dict[str, Agent] = {}  # kept so folder approvals last while the server runs
         self.turns: dict[str, Turn] = {}
+        self.jobs: dict[str, threading.Event] = {}  # research running here -> its stop signal
 
     def _running(self, conversation_id: str) -> Turn | None:
         turn = self.turns.get(conversation_id)
@@ -183,8 +185,110 @@ class App:
                 }
                 for p in self.providers.values()
             ],
+            "search": self.search_state(),
             "conversations": self._conversation_list(),
         }
+
+    def search_state(self) -> dict:
+        try:
+            using = search.current().name
+        except ValueError:
+            using = ""
+        return {
+            "using": using,
+            "services": [
+                {"name": s.name, "ready": s.ready, "local": s.is_local, "note": s.policy_note, "url": s.policy_url}
+                for s in search.load_backends().values()
+            ],
+        }
+
+    # ---- research, which runs in the background for as long as the server does ----
+
+    def research_list(self) -> dict:
+        try:
+            allows = research.describe(search.current())
+        except ValueError as e:
+            allows = str(e)
+        return {
+            "allows": allows,
+            "jobs": [
+                {
+                    "id": j["id"],
+                    "topic": j["topic"],
+                    "title": j.get("title") or j["topic"],
+                    "emoji": j.get("emoji"),
+                    "color": j.get("color"),
+                    "status": research.status(j, j["id"] in self.jobs),
+                    "created": j["created"],
+                    "sources": len(j["sources"]),
+                    "last": j["log"][-1] if j["log"] else "",
+                }
+                for j in self.store.list_research()
+            ],
+        }
+
+    def research_get(self, research_id: str) -> dict:
+        try:
+            job = self.store.load_research(research_id)
+        except (OSError, ValueError):
+            raise ApiError(404, "no such research") from None
+        job["status"] = research.status(job, research_id in self.jobs)
+        return job
+
+    def research_start(self, topic: str, provider_name: str, model: str | None, retry: str | None = None) -> str:
+        """Start a job, or with retry, write the report again for a job whose reading was done."""
+        job = None
+        if retry:
+            job = self.research_get(retry)
+            if retry in self.jobs or not job.get("gathered") or job["status"] == "done":
+                raise ApiError(409, "this research cannot be retried")
+            topic = job["topic"]
+        topic = " ".join(topic.split())
+        if not topic:
+            raise ApiError(400, "empty topic")
+        provider = self._provider(provider_name)
+        try:
+            model = pick_model(provider, model)
+            backend = search.current()
+        except (ProviderError, ValueError) as e:
+            raise ApiError(400, str(e)) from None
+        job = job or self.store.new_research(topic)
+        job["status"] = "running"
+        self.store.save_research(job)
+        stop = threading.Event()
+        self.jobs[job["id"]] = stop
+
+        def work():
+            try:
+                research.Research(provider, model, self.store, backend, stop=stop).run(topic, job)
+            except Exception as e:  # keep the server alive; the job file says what happened
+                job.update(status="failed", error=f"internal error: {e!r}", finished=time.time())
+                self.store.save_research(job)
+            finally:
+                self.jobs.pop(job["id"], None)
+
+        threading.Thread(target=work, daemon=True).start()
+        return job["id"]
+
+    def research_stop(self, research_id: str) -> None:
+        stop = self.jobs.get(research_id)
+        if stop:
+            stop.set()
+
+    def research_delete(self, research_id: str) -> None:
+        if research_id in self.jobs:
+            raise ApiError(409, "this research is still running; stop it first")
+        try:
+            self.store.delete_research(research_id)
+        except (OSError, ValueError):
+            raise ApiError(404, "no such research") from None
+
+    def select_search(self, name: str) -> dict:
+        try:
+            search.select(name)
+        except ValueError as e:
+            raise ApiError(400, str(e)) from None
+        return self.search_state()
 
     def _conversation_list(self) -> list[dict]:
         saved = self.store.list()
@@ -268,6 +372,7 @@ class App:
             conversation_id = agent.conversation["id"]
             turn = Turn(text, len(agent.conversation["messages"]), self.detached_timeout)
             agent.ui = agent.toolbox.ui = WebUI(turn)
+            agent.toolbox.research_in_background = lambda topic: self.research_start(topic, provider.name, model)
             self.agents[conversation_id] = agent
             self.turns[conversation_id] = turn
 
@@ -403,6 +508,7 @@ class Handler(BaseHTTPRequestHandler):
         app = self.app
         static = "index.html" if path == "/" else path.lstrip("/")
         conv = re.fullmatch(r"/api/conversations/([\w-]+)(/events|/answer|/stop|/move)?", path)
+        job = re.fullmatch(r"/api/research/([\w-]+)(/stop)?", path)
 
         if method == "GET" and static in STATIC_TYPES:
             self._send(200, (STATIC / static).read_bytes(), STATIC_TYPES[static])
@@ -412,6 +518,24 @@ class Handler(BaseHTTPRequestHandler):
             self._json(app.models(query.get("provider", [""])[0]))
         elif method == "GET" and path == "/api/memory":
             self._json({"facts": app.store.memory()})
+        elif method == "GET" and path == "/api/research":
+            self._json(app.research_list())
+        elif method == "POST" and path == "/api/research":
+            body = self._body()
+            started = app.research_start(
+                str(body.get("topic", "")), str(body.get("provider", "")), body.get("model"), body.get("retry")
+            )
+            self._json({"id": started})
+        elif job and method == "GET" and job[2] is None:
+            self._json(app.research_get(job[1]))
+        elif job and method == "DELETE" and job[2] is None:
+            app.research_delete(job[1])
+            self._json({})
+        elif job and method == "POST" and job[2] == "/stop":
+            app.research_stop(job[1])
+            self._json({})
+        elif method == "POST" and path == "/api/search":
+            self._json(app.select_search(str(self._body().get("name", ""))))
         elif method == "POST" and path == "/api/memory/forget":
             app.store.forget(str(self._body().get("fact", "")), exact=True)
             self._json({"facts": app.store.memory()})

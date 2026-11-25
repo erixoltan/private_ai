@@ -170,4 +170,16 @@ Check the sources before relying on a claim.
 
 The agent can read and write local files, but only after asking you. The
 question says whether the contents would stay on your machine or go to a cloud
-provider. The folder holding your API keys is always off limits.
+provider. Before a file is written you are shown what would be written: the
+contents of a new file, or the lines that change in an existing one.
+
+* The folder holding your API keys is always off limits.
+* The assistant cannot write to its own data folder with the file tools.
+* Places that usually hold secrets (`~/.ssh`, `~/.aws`, browser profiles,
+  `.env` files, private keys and the like) are asked about every time, with a
+  warning, even inside a folder you approved for the session.
+* Writing a file the system runs by itself (`~/.bashrc`, autostart entries,
+  git hooks, system folders) also carries a warning.
+
+These lists cover well-known locations and cannot be complete. Read the path
+in every question.

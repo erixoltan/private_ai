@@ -88,7 +88,7 @@ details.thinking { font-size: 13px; color: var(--muted); border-left: 2px solid 
 details.thinking summary { cursor: pointer; }
 details.thinking div { white-space: pre-wrap; overflow-wrap: anywhere; margin-top: 4px; }
 .ask { padding: 12px; border: 1px solid var(--cloud); border-radius: 8px; }
-.ask p { margin: 0 0 8px; white-space: pre-wrap; overflow-wrap: anywhere; }
+.ask p { margin: 0 0 8px; white-space: pre-wrap; overflow-wrap: anywhere; max-height: 50vh; overflow-y: auto; }
 .ask .choices { display: flex; flex-wrap: wrap; gap: 8px; }
 .ask.settled { border-color: var(--line); color: var(--muted); }
 

@@ -4,8 +4,14 @@ conversations, access to local files with the user's permission, and the web.
 File rules:
 * Reading needs the user's approval, once per file or for a whole folder for
   the rest of the session. The prompt says where the contents will go.
-* Writing needs approval every single time.
+* Writing needs approval every single time. The prompt shows what would be
+  written: the contents of a new file, or the changes to an existing one.
 * The config folder, which holds API keys, is never readable or writable.
+* The assistant's own data folder is never writable with the file tools, so
+  nothing it reads can talk it into rewriting its memory or its history.
+* Paths that usually hold secrets, and paths the system runs automatically
+  (see sensitive.py), are asked about every time with a warning. A folder
+  approval never covers them.
 
 Web rules:
 * A search query is shown to the user before it is sent, with where it is
@@ -26,6 +32,7 @@ Research rules:
 
 from __future__ import annotations
 
+import difflib
 import json
 import re
 import time
@@ -33,7 +40,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Protocol
 
-from private_ai import research, search
+from private_ai import research, search, sensitive
 from private_ai.client import ProviderError
 from private_ai.fetch import FetchError, read_page
 from private_ai.providers import Provider, config_path
@@ -41,6 +48,9 @@ from private_ai.store import Store
 
 MAX_FILE_CHARS = 100_000
 MAX_DIR_ENTRIES = 500
+MAX_PREVIEW_LINES = 80  # of a write shown in the approval question
+MAX_PREVIEW_LINE_CHARS = 300
+MAX_DIFF_CHARS = 500_000  # larger files are not compared; the new contents are shown instead
 MAX_PAGE_CHARS = 24_000  # of one web page shown to the model; the whole page is saved locally
 MAX_SEARCHES_PER_MESSAGE = 6
 MAX_PAGES_PER_MESSAGE = 8
@@ -393,6 +403,16 @@ class Toolbox:
         return f"The contents will be sent to {self.provider.name} (cloud)."
 
     def _approve_read(self, path: Path, folder: Path, what: str) -> None:
+        warning = sensitive.secret(path)
+        if warning:
+            # Asked every time: a folder approval was not given with secrets in mind.
+            answer = self.ui.ask(
+                f"WARNING: allow the assistant to {what} {path}?\n{warning}\n{self._destination()}",
+                {"y": "yes, once", "n": "no"},
+            )
+            if answer != "y":
+                raise ToolError("the user did not allow this.")
+            return
         if any(d == path or d in path.parents for d in self.readable_dirs):
             return
         answer = self.ui.ask(
@@ -430,15 +450,47 @@ class Toolbox:
             lines.append(f"[{len(entries) - MAX_DIR_ENTRIES} more not shown]")
         return "\n".join(lines) or "(empty folder)"
 
+    def _write_preview(self, target: Path, content: str) -> str:
+        """What the user is shown before approving a write."""
+        heading, lines = "Contents:", content.splitlines()
+        if target.exists():
+            data = target.read_bytes()
+            if b"\0" in data[:4096]:
+                heading = "The existing file is binary and would be lost. New contents:"
+            elif len(data) > MAX_DIFF_CHARS or len(content) > MAX_DIFF_CHARS:
+                heading = "Too large to compare with the existing file. New contents:"
+            else:
+                old = data.decode("utf-8", errors="replace")
+                if old == content:
+                    return "The contents are identical to the existing file."
+                heading = "Changes (- removed, + added):"
+                lines = list(difflib.unified_diff(old.splitlines(), content.splitlines(), lineterm="", n=2))[2:]
+                if old.endswith("\n") != content.endswith("\n"):
+                    lines.append("(the final line ending also changes)")
+        if not lines:
+            return "The file would be empty."
+        shown = [
+            line if len(line) <= MAX_PREVIEW_LINE_CHARS
+            else f"{line[:MAX_PREVIEW_LINE_CHARS]}[{len(line) - MAX_PREVIEW_LINE_CHARS} more characters on this line]"
+            for line in lines[:MAX_PREVIEW_LINES]
+        ]
+        if len(lines) > MAX_PREVIEW_LINES:
+            shown.append(f"[NOT SHOWN: {len(lines) - MAX_PREVIEW_LINES} more lines]")
+        return heading + "\n" + "\n".join(shown)
+
     def _write_file(self, path: str, content: str) -> str:
         target = self._resolve(path)
+        data = self.store.root.resolve()
+        if target == data or data in target.parents:
+            raise ToolError("that folder holds the assistant's own data and cannot be written with this tool.")
         if target.is_dir():
             raise ToolError(f"{target} is a folder.")
         action = "REPLACE the existing file" if target.exists() else "create the new file"
-        answer = self.ui.ask(
-            f"Allow the assistant to {action} {target}? ({len(content)} characters)",
-            {"y": "yes", "n": "no"},
-        )
+        warning = sensitive.secret(target) or sensitive.runs_code(target)
+        question = f"Allow the assistant to {action} {target}? ({len(content)} characters)"
+        if warning:
+            question = f"WARNING: {question[0].lower()}{question[1:]}\n{warning}"
+        answer = self.ui.ask(f"{question}\n\n{self._write_preview(target, content)}", {"y": "yes", "n": "no"})
         if answer != "y":
             raise ToolError("the user did not allow this.")
         target.write_text(content, encoding="utf-8")

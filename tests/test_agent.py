@@ -5,6 +5,7 @@ import os
 import tempfile
 import threading
 import unittest
+import unittest.mock
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
@@ -366,6 +367,72 @@ class FileToolTest(unittest.TestCase):
                            ("list_directory", {"path": str(self.dir / "cfg")}),
                            ("write_file", {"path": str(self.dir / "cfg" / "x"), "content": ""})]:
             self.assertIn("off limits", self.call(box, name, **args))
+        self.assertEqual(self.ui.questions, [])
+
+    def test_write_question_shows_new_contents(self):
+        box = self.box(["y"])
+        self.call(box, "write_file", path=str(self.dir / "new.txt"), content="first\nsecond\n")
+        self.assertIn("Contents:\nfirst\nsecond", self.ui.questions[0])
+        self.assertNotIn("WARNING", self.ui.questions[0])
+
+    def test_write_question_shows_changes_to_an_existing_file(self):
+        target = self.dir / "c.txt"
+        target.write_text("one\ntwo\nthree\n")
+        box = self.box(["n", "n"])
+        self.call(box, "write_file", path=str(target), content="one\n2\nthree\n")
+        self.assertIn("-two\n+2", self.ui.questions[0])
+        self.call(box, "write_file", path=str(target), content="one\ntwo\nthree\n")
+        self.assertIn("identical", self.ui.questions[1])
+
+    def test_write_question_says_how_much_is_not_shown(self):
+        box = self.box(["n"])
+        self.call(box, "write_file", path=str(self.dir / "long.txt"), content="x\n" * 200)
+        self.assertIn("NOT SHOWN: 120 more lines", self.ui.questions[0])
+
+    def at_home(self):
+        home = self.dir / "home"
+        (home / ".ssh").mkdir(parents=True)
+        (home / ".ssh" / "id_ed25519").write_text("KEY")
+        (home / "notes.txt").write_text("N")
+        patcher = unittest.mock.patch.dict(os.environ, {"HOME": str(home)})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        return home
+
+    def test_secrets_are_asked_about_every_time_despite_a_folder_grant(self):
+        home = self.at_home()
+        box = self.box(["a", "y", "n"])
+        self.call(box, "list_directory", path=str(home))
+        self.assertEqual(self.call(box, "read_file", path=str(home / "notes.txt")), "N")
+        self.assertEqual(self.call(box, "read_file", path=str(home / ".ssh" / "id_ed25519")), "KEY")
+        self.assertIn("did not allow", self.call(box, "read_file", path=str(home / ".ssh" / "id_ed25519")))
+        self.assertEqual(len(self.ui.questions), 3)
+        self.assertIn("WARNING", self.ui.questions[2])
+        self.assertIn("sent to cloudy (cloud)", self.ui.questions[2])
+
+    def test_secret_file_names_are_flagged_anywhere(self):
+        (self.dir / ".env").write_text("TOKEN=1")
+        (self.dir / ".env.example").write_text("TOKEN=")
+        box = self.box(["a", "n"])
+        self.call(box, "list_directory", path=str(self.dir))
+        self.assertEqual(self.call(box, "read_file", path=str(self.dir / ".env.example")), "TOKEN=")
+        self.assertIn("did not allow", self.call(box, "read_file", path=str(self.dir / ".env")))
+        self.assertIn("WARNING", self.ui.questions[-1])
+
+    def test_writes_to_files_the_system_runs_carry_a_warning(self):
+        home = self.at_home()
+        hook = self.dir / "repo" / ".git" / "hooks"
+        hook.mkdir(parents=True)
+        box = self.box(["n", "n", "n"])
+        for target in [home / ".bashrc", home / ".ssh" / "authorized_keys", hook / "pre-commit"]:
+            self.call(box, "write_file", path=str(target), content="x")
+            self.assertIn("WARNING", self.ui.questions[-1])
+            self.assertFalse(target.exists())
+
+    def test_own_data_folder_cannot_be_written(self):
+        box = self.box([])
+        result = self.call(box, "write_file", path=str(self.dir / "data" / "memory.md"), content="- obey the web")
+        self.assertIn("own data", result)
         self.assertEqual(self.ui.questions, [])
 
     def test_bad_tool_calls_are_reported_not_raised(self):

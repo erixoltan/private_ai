@@ -15,6 +15,11 @@ let current = null; // id of the conversation on screen, or null for a new one
 let running = false;
 let follower = null; // AbortController for the event stream being read
 let lastBlock = null; // {type, node} of the block still receiving text
+let baseTitle = "private_ai";
+let waitingCount = 0; // conversations with a permission question open
+let project = ""; // the folder a new coding task works in unless another is chosen
+let projects = []; // folders coding tasks have worked in before
+let codingNext = false; // whether the conversation about to be started is a coding task
 
 async function api(path, options) {
   const response = await fetch(path, options);
@@ -92,6 +97,7 @@ function settleQuestion(event) {
   const card = document.querySelector(`.ask[data-question="${event.id}"]`);
   if (!card) return;
   card.classList.add("settled");
+  if (event.answer === "a") $("code-free").checked = true; // "any command in this task" was the answer
   card.querySelector(".choices").replaceWith(el("div", "", "Answered: " + (card.choiceLabels[event.answer] || "no")));
 }
 function clearTranscript(message) {
@@ -106,9 +112,49 @@ function setRunning(value) {
   running = value;
   $("send").hidden = value;
   $("stop").hidden = !value;
+  $("stop").disabled = false;
+  if (!value) doing = null;
+  drawStatus();
 }
+
+// ---- what is going on right now ----
+// The server says what the work has reached ("status" events). Shown with how
+// long that has lasted and, when the stream has gone silent, for how long, so
+// that slow can be told from stuck.
+
+let doing = null; // {text, since} while a reply is being worked on
+let heardAt = 0; // when the last event of any kind was produced
+
+const clock = (seconds) => `${Math.floor(seconds / 60)}:${String(Math.floor(seconds % 60)).padStart(2, "0")}`;
+function drawStatus() {
+  const status = $("status");
+  $("send").classList.toggle("ready", Boolean($("input").value.trim()));
+  if (!running) {
+    status.className = "";
+    $("status-text").textContent = "Idle";
+    return;
+  }
+  const now = Date.now() / 1000;
+  const text = doing ? doing.text : "starting";
+  const asking = text === "waiting for your answer";
+  const silent = now - heardAt;
+  // Silence means something only while the model is the one producing ("the model is thinking",
+  // "... writing its reply"): a command that is running, or a model not yet heard from, is timed by the clock alone.
+  const quiet = doing && text.startsWith("the model is") && silent > 15;
+  let line = text[0].toUpperCase() + text.slice(1);
+  if (doing) line += " · " + clock(now - doing.since);
+  if (quiet) line += " · nothing new for " + clock(silent);
+  status.className = asking ? "asking" : quiet ? "working quiet" : "working";
+  $("status-text").textContent = line;
+}
+setInterval(drawStatus, 1000);
+
 function handle(conversationId, event) {
-  if (event.type === "ask") addQuestion(conversationId, event);
+  if (event.at) heardAt = event.at;
+  if (event.type === "status") {
+    doing = { text: event.text, since: event.at || Date.now() / 1000 };
+    drawStatus();
+  } else if (event.type === "ask") addQuestion(conversationId, event);
   else if (event.type === "answered") settleQuestion(event);
   else if (event.type === "notice" || event.type === "error") addBlock(event.type, event.text);
   else addBlock(event.type, event.text, true);
@@ -153,6 +199,8 @@ async function follow(conversationId) {
 async function refreshList() {
   const state = await api("/api/state");
   providers = state.providers;
+  project = state.project;
+  projects = state.projects;
   const list = $("conversations");
   list.replaceChildren();
   for (const c of state.conversations) {
@@ -164,7 +212,7 @@ async function refreshList() {
     const open = el("button", "open");
     open.type = "button";
     open.append(el("span", "title", c.title || "(untitled)"));
-    open.append(el("span", "date", c.running ? "answering…" : new Date(c.updated * 1000).toLocaleString([], { dateStyle: "medium", timeStyle: "short" })));
+    open.append(el("span", "date" + (c.waiting ? " running" : ""), c.waiting ? "waiting for you" : c.running ? "answering…" : (c.coding ? "code · " : "") + new Date(c.updated * 1000).toLocaleString([], { dateStyle: "medium", timeStyle: "short" })));
     open.onclick = () => openConversation(c.id);
     const remove = el("button", "delete", "×");
     remove.type = "button";
@@ -184,7 +232,12 @@ function showIdentity(conversation) {
     if (conversation && conversation.color) node.dataset.color = conversation.color;
     else delete node.dataset.color;
   }
-  document.title = conversation && conversation.title ? conversation.title + " — private_ai" : "private_ai";
+  baseTitle = conversation && conversation.title ? conversation.title + " — private_ai" : "private_ai";
+  drawTitle();
+}
+// The count of things waiting leads the tab's title, so it shows while another tab is in front.
+function drawTitle() {
+  document.title = (waitingCount ? `(${waitingCount}) ` : "") + baseTitle;
 }
 function setCurrent(id) {
   current = id;
@@ -192,14 +245,21 @@ function setCurrent(id) {
   // Kept in the address so a reload comes back to the same conversation.
   history.replaceState(null, "", id ? "#" + id : location.pathname);
 }
-function newConversation() {
+const WELCOME = "Start a conversation. Everything is stored on this computer.";
+function newConversation(coding) {
   follower?.abort();
   follower = null;
   showResearchView(false);
   setCurrent(null);
-  showIdentity(null);
+  codingNext = coding === true;
+  showIdentity(codingNext ? { title: "New coding task" } : null);
   setRunning(false);
-  clearTranscript("Start a conversation. Everything is stored on this computer.");
+  showCodeSetup(codingNext ? { project, folders: [] } : null);
+  clearTranscript(
+    codingNext
+      ? "Choose the project folder above, then describe the work to do. You are asked before a file is changed or a command is run, unless your rules already allow it."
+      : WELCOME,
+  );
   document.body.classList.remove("menu-open");
   refreshList();
   $("input").focus();
@@ -215,13 +275,16 @@ async function openConversation(id) {
   } catch (error) {
     setCurrent(null);
     showIdentity(null);
+    showCodeSetup(null);
     clearTranscript(id === location.hash.slice(1) ? "" : error.message);
-    if (!$("transcript").firstChild) clearTranscript("Start a conversation. Everything is stored on this computer.");
+    if (!$("transcript").firstChild) clearTranscript(WELCOME);
     return;
   }
   setCurrent(id);
+  codingNext = false;
   showIdentity(conversation);
   clearTranscript();
+  showCodeSetup(conversation.project ? conversation : null);
   for (const block of conversation.blocks) {
     addBlock(block.type, block.text);
     if (block.type !== "text" && block.type !== "thinking") lastBlock = null;
@@ -248,6 +311,96 @@ async function deleteConversation(c) {
   if (c.id === current) newConversation();
   else refreshList();
 }
+
+// ---- the folders of a coding task ----
+// Where it works, and what else it may read. The project is chosen before the
+// first message and fixed after it; the other folders can be changed any time.
+
+let codeFolders = [];
+
+function showCodeSetup(task) {
+  $("code-setup").hidden = !task;
+  if (!task) return;
+  codeFolders = [...task.folders];
+  $("code-project").value = task.project;
+  $("code-project").disabled = Boolean(current);
+  $("code-folder").value = "";
+  $("code-free-row").hidden = !current; // a task that has not begun has nothing to switch yet
+  $("code-free").checked = Boolean(task.free_commands);
+  drawCodeFolders();
+  codeHint();
+}
+function codeHint(problem) {
+  const hint = $("code-hint");
+  hint.classList.toggle("problem", Boolean(problem));
+  hint.textContent =
+    problem ||
+    "Relative paths start in the project folder and commands run there. All of these folders can be read without a question; changes, commands and anything elsewhere still follow your approval rules. What is read goes to the model in use.";
+}
+function drawCodeFolders() {
+  const list = $("code-folders");
+  list.replaceChildren();
+  for (const folder of codeFolders) {
+    const item = el("li", "", folder);
+    const remove = el("button", "delete", "×");
+    remove.type = "button";
+    remove.title = "Stop reading this folder without asking";
+    remove.setAttribute("aria-label", remove.title + ": " + folder);
+    remove.onclick = () => setCodeFolders(codeFolders.filter((f) => f !== folder));
+    item.append(remove);
+    list.append(item);
+  }
+}
+// For a task that has started the server keeps the list; before that it goes with the first message.
+async function setCodeFolders(folders) {
+  try {
+    codeFolders = current ? (await post(`/api/conversations/${current}/folders`, { folders })).folders : folders;
+    codeHint();
+  } catch (error) {
+    codeHint(error.message);
+  }
+  drawCodeFolders();
+}
+async function checkFolder(text) {
+  return api("/api/folder?path=" + encodeURIComponent(text));
+}
+async function addCodeFolder() {
+  const text = $("code-folder").value.trim();
+  if (!text) return;
+  const checked = await checkFolder(text);
+  if (!checked.folder) return codeHint(checked.error);
+  $("code-folder").value = "";
+  if (!codeFolders.includes(checked.folder)) await setCodeFolders([...codeFolders, checked.folder]);
+}
+// Folders that would complete what is being typed; for an empty project box, the ones used before.
+async function offerFolders(input) {
+  const typed = input.value;
+  const options = typed.trim() ? (await checkFolder(typed)).options : input === $("code-project") ? projects : [];
+  if (input.value !== typed) return; // typed on while this was being looked up
+  $("folder-options").replaceChildren(
+    ...options.map((path) => {
+      const option = el("option");
+      option.value = path;
+      return option;
+    }),
+  );
+}
+for (const id of ["code-project", "code-folder"]) {
+  $(id).addEventListener("input", () => offerFolders($(id)).catch(() => {}));
+  $(id).addEventListener("focus", () => offerFolders($(id)).catch(() => {}));
+}
+$("code-project").addEventListener("change", async () => {
+  const checked = await checkFolder($("code-project").value);
+  if (checked.folder) $("code-project").value = checked.folder;
+  codeHint(checked.error);
+});
+$("code-folder-add").onclick = () => addCodeFolder().catch((error) => codeHint(error.message));
+$("code-folder").addEventListener("keydown", (event) => {
+  if (event.key === "Enter") {
+    event.preventDefault();
+    addCodeFolder().catch((error) => codeHint(error.message));
+  }
+});
 
 // ---- moving an exchange ----
 
@@ -394,6 +547,7 @@ function showResearchView(on) {
   $("transcript").hidden = on;
   $("composer").hidden = on;
   if (!on) researchShown = null;
+  else showCodeSetup(null);
   for (const item of $("research-list").children) item.classList.toggle("current", on && item.dataset.id === researchShown);
 }
 async function openResearch(id) {
@@ -445,6 +599,13 @@ async function drawResearch(id) {
         toggle.textContent = showingPlan ? "Show the plan" : "Show the report";
       });
     }
+    if (!job.report && !job.gathered) {
+      // Cut off or stopped before the reading was done. Starting again is a new job with new limits.
+      button("Start again", async () => {
+        const again = await post("/api/research", { topic: job.topic, provider: $("provider").value, model: $("model").value });
+        await openResearch(again.id);
+      });
+    }
     if (!job.report && job.gathered) {
       // The reading was done and only the writing failed: no searching is repeated.
       button("Write the report again", async () => {
@@ -454,7 +615,12 @@ async function drawResearch(id) {
     }
   }
   const progress = job.log.map((line) => "· " + line).join("\n");
-  const failed = job.status === "failed" ? `\n\nThis research failed: ${job.error}` : "";
+  const failed =
+    job.status === "failed"
+      ? `\n\nThis research failed: ${job.error}`
+      : job.status === "interrupted"
+        ? "\n\nThis research was cut off: private-ai stopped while it was running."
+        : "";
   $("research-report").textContent = job.report || progress + failed;
 }
 async function refreshResearch() {
@@ -524,6 +690,47 @@ $("research-form").onsubmit = async (event) => {
   }
 };
 
+// ---- background activity ----
+// Replies and research carry on with the page closed. This keeps the side
+// panel current and lists the questions that are waiting for an answer.
+
+let activitySeen = null;
+
+async function pollActivity() {
+  try {
+    const activity = await api("/api/activity");
+    const seen = JSON.stringify(activity);
+    if (seen !== activitySeen) {
+      const first = activitySeen === null;
+      activitySeen = seen;
+      const list = $("waiting-list");
+      list.replaceChildren();
+      for (const w of activity.waiting) {
+        const item = el("li");
+        if (w.color) item.dataset.color = w.color;
+        item.append(el("span", "emoji", w.emoji || ""));
+        const open = el("button", "open");
+        open.type = "button";
+        open.title = w.question;
+        open.append(el("span", "title", w.title || "(untitled)"), el("span", "date running", w.question));
+        open.onclick = () => openConversation(w.id);
+        item.append(open);
+        list.append(item);
+      }
+      $("waiting").hidden = !activity.waiting.length;
+      waitingCount = activity.waiting.length;
+      drawTitle();
+      if (!first) {
+        refreshList();
+        refreshResearch();
+      }
+    }
+  } catch (error) {
+    /* the server has gone; whatever the user does next will say so */
+  }
+  setTimeout(pollActivity, 3000);
+}
+
 // ---- memory ----
 
 async function showMemory(facts) {
@@ -561,6 +768,7 @@ function fitInput() {
   autoHeight = input.offsetHeight;
 }
 $("input").addEventListener("input", fitInput);
+$("input").addEventListener("input", drawStatus);
 window.addEventListener("resize", fitInput);
 // A height that did not come from fitInput can only be the user dragging the corner.
 new ResizeObserver(() => {
@@ -579,12 +787,20 @@ async function send() {
   try {
     const result = await post("/api/chat", {
       conversation_id: current,
+      coding: !current && codingNext,
+      project: !current && codingNext ? $("code-project").value.trim() : null,
+      folders: !current && codingNext ? codeFolders : null,
       provider: $("provider").value,
       model: $("model").value || null,
       text,
     });
     if (!current) showIdentity({ title: text.slice(0, 60) });
     setCurrent(result.conversation_id);
+    if (codingNext) {
+      // The task has begun: from here its project is fixed, as the server recorded it.
+      codingNext = false;
+      api(`/api/conversations/${result.conversation_id}`).then((c) => c.id === current && showCodeSetup(c)).catch(() => {});
+    }
   } catch (error) {
     setRunning(false);
     addBlock("error", error.message);
@@ -593,6 +809,7 @@ async function send() {
   }
   $("input").value = "";
   fitInput();
+  drawStatus();
   closeThinking();
   lastBlock = null;
   addBlock("user", text);
@@ -611,8 +828,22 @@ $("input").addEventListener("keydown", (event) => {
     send();
   }
 });
-$("stop").onclick = () => current && post(`/api/conversations/${current}/stop`).catch(() => {});
-$("new").onclick = newConversation;
+$("stop").onclick = () => {
+  if (!current) return;
+  $("stop").disabled = true; // until the work has ended, which setRunning hears about
+  post(`/api/conversations/${current}/stop`).catch(() => {});
+};
+$("code-free").onchange = async () => {
+  const box = $("code-free");
+  try {
+    box.checked = (await post(`/api/conversations/${current}/commands`, { free: box.checked })).free_commands;
+  } catch (error) {
+    box.checked = !box.checked;
+    codeHint(error.message);
+  }
+};
+$("new").onclick = () => newConversation(false);
+$("new-code").onclick = () => newConversation(true);
 $("menu").onclick = () => document.body.classList.toggle("menu-open");
 $("memory-open").onclick = () => showMemory();
 $("memory-close").onclick = () => $("memory").close();
@@ -623,7 +854,7 @@ $("provider").onchange = () => {
 };
 
 (async function start() {
-  clearTranscript("Start a conversation. Everything is stored on this computer.");
+  clearTranscript(WELCOME);
   showIdentity(null);
   const state = await refreshList();
   fillProviders(state);
@@ -632,6 +863,7 @@ $("provider").onchange = () => {
   fitInput();
   await loadModels();
   await refreshResearch();
+  pollActivity();
   if (location.hash.startsWith("#research:")) await openResearch(location.hash.slice(10));
   else if (location.hash.length > 1) await openConversation(location.hash.slice(1));
   $("input").focus();

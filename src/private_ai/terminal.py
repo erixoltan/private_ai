@@ -8,9 +8,11 @@ import sys
 import time
 import unicodedata
 from collections.abc import Callable
+from pathlib import Path
 
 from private_ai import research, search
 from private_ai.agent import Agent, pick_model, ready
+from private_ai.approvals import chosen_folder
 from private_ai.client import ProviderError
 from private_ai.providers import Provider
 from private_ai.store import Store
@@ -35,6 +37,9 @@ HELP = """\
 /research            list saved research; /research N prints report N
 /research plan N     print the plan (outline and reasoning) behind report N
 /research TOPIC      research a topic on the web and save a report
+/rules               show the approval rules in force here
+/read [FOLDER]       coding: show the folders that may be read besides the project, or add one
+/read not FOLDER     ... or take one away
 /quit                leave (Ctrl-D also works)"""
 
 
@@ -137,6 +142,9 @@ class TerminalUI:
         self.end_line()
         print(self._dim(f"  [{message}]"))
 
+    def status(self, doing: str) -> None:
+        pass  # the terminal shows the work itself as it happens
+
     def ask(self, question: str, choices: dict[str, str]) -> str:
         self.end_line()
         print(f"\n{question}")
@@ -159,6 +167,13 @@ def _banner(agent: Agent) -> None:
     if not p.is_local and p.policy_note:
         print(f"  {p.policy_note} Not verified by this program: {p.policy_url}")
     _search_line()
+    if agent.coding:
+        policy = agent.toolbox.policy
+        print(f"coding in {policy.project} · trust: {policy.trust} · /rules shows what is allowed without asking")
+        if policy.trust == "all":
+            print("  Everything is allowed without asking, including any command.")
+        if policy.folders:
+            print("  may also read: " + ", ".join(str(f) for f in policy.folders))
 
 
 def _search_line() -> None:
@@ -183,10 +198,33 @@ def _show_history(conversation: dict, ui: TerminalUI) -> None:
     print()
 
 
-def run_chat(providers: dict[str, Provider], provider_name: str, model: str | None, resume: str | None) -> int:
+def _rules(agent: Agent) -> None:
+    policy = agent.toolbox.policy
+    print(f"project: {policy.project}\ntrust:   {policy.trust}\nrules:   {policy.path}")
+    rules = policy.rules()
+    print("\n".join(f"  {r.describe()}  [{r.source}]" for r in rules) or "  (no rules: everything is asked)")
+    if policy.problem:
+        print(f"warning: {policy.problem}")
+
+
+def run_chat(
+    providers: dict[str, Provider],
+    provider_name: str,
+    model: str | None,
+    resume: str | None,
+    coding: bool = False,
+    trust: str = "ask",
+    read: list[str] | tuple[str, ...] = (),
+) -> int:
     store = Store()
     ui = TerminalUI()
+    folders: tuple[Path, ...] = ()
+
+    def make(provider: Provider, model: str, conversation: dict | None = None) -> Agent:
+        return Agent(provider, model, store, ui, conversation, coding, trust, folders=folders)
+
     try:
+        folders = tuple(chosen_folder(name, Path.cwd()) for name in read)
         if provider_name not in providers:
             raise ProviderError(f"unknown provider '{provider_name}'; known: {', '.join(providers)}")
         provider = ready(providers[provider_name])
@@ -198,8 +236,8 @@ def run_chat(providers: dict[str, Provider], provider_name: str, model: str | No
                 conversation = next((c for c in saved if c["id"] == resume), None)
             if conversation is None:
                 raise ProviderError(f"no saved conversation to resume ({resume})")
-        agent = Agent(provider, pick_model(provider, model), store, ui, conversation)
-    except ProviderError as e:
+        agent = make(provider, pick_model(provider, model), conversation)
+    except (ProviderError, ValueError) as e:
         print(f"error: {e}", file=sys.stderr)
         return 2
 
@@ -230,7 +268,7 @@ def run_chat(providers: dict[str, Provider], provider_name: str, model: str | No
                 elif command == "/help":
                     print(HELP)
                 elif command == "/new":
-                    agent = Agent(agent.provider, agent.model, store, ui)
+                    agent = make(agent.provider, agent.model)
                     print("New conversation.")
                 elif command == "/list":
                     listed = store.list()[:20]
@@ -244,7 +282,7 @@ def run_chat(providers: dict[str, Provider], provider_name: str, model: str | No
                     index = int(arg or 1) - 1
                     if not 0 <= index < len(listed):
                         raise ValueError("no such conversation; see /list")
-                    agent = Agent(agent.provider, agent.model, store, ui, listed[index])
+                    agent = make(agent.provider, agent.model, listed[index])
                     _show_history(agent.conversation, ui)
                 elif command == "/delete":
                     index = int(arg or 0) - 1
@@ -254,7 +292,7 @@ def run_chat(providers: dict[str, Provider], provider_name: str, model: str | No
                     store.delete(doomed["id"])
                     print(f"Deleted: {_label(doomed)}")
                     if doomed["id"] == agent.conversation["id"]:
-                        agent = Agent(agent.provider, agent.model, store, ui)
+                        agent = make(agent.provider, agent.model)
                         print("New conversation.")
                 elif command == "/move":
                     index = int(arg or 0) - 1 if arg != "new" else None
@@ -268,10 +306,10 @@ def run_chat(providers: dict[str, Provider], provider_name: str, model: str | No
                     print(f"Moved the latest exchange to: {_label(target) or '(new conversation)'}")
                     listed = []
                     if emptied:
-                        agent = Agent(agent.provider, agent.model, store, ui)
+                        agent = make(agent.provider, agent.model)
                         print("That left this conversation empty, so it was removed. New conversation.")
                     else:
-                        agent = Agent(agent.provider, agent.model, store, ui, store.load(agent.conversation["id"]))
+                        agent = make(agent.provider, agent.model, store.load(agent.conversation["id"]))
                 elif command == "/memory":
                     facts = store.memory()
                     print("\n".join(f"- {f}" for f in facts) or "Nothing remembered yet.")
@@ -284,12 +322,12 @@ def run_chat(providers: dict[str, Provider], provider_name: str, model: str | No
                     if name not in providers:
                         raise ValueError(f"known providers: {', '.join(providers)}")
                     new = ready(providers[name])
-                    agent = Agent(new, pick_model(new, new_model.strip() or None), store, ui, agent.conversation)
+                    agent = make(new, pick_model(new, new_model.strip() or None), agent.conversation)
                     _banner(agent)
                 elif command == "/research":
                     jobs = store.list_research()
                     if not arg:
-                        print("\n".join(f"{n:>2}. {research.summary_line(j)}" for n, j in enumerate(jobs, 1)) or "No research yet.")
+                        print("\n".join(f"{n:>2}. {research.summary_line(j, store)}" for n, j in enumerate(jobs, 1)) or "No research yet.")
                     elif arg.removeprefix("plan ").strip().isdigit():
                         number = int(arg.removeprefix("plan "))
                         if not 0 < number <= len(jobs):
@@ -298,7 +336,7 @@ def run_chat(providers: dict[str, Provider], provider_name: str, model: str | No
                         if arg.startswith("plan"):
                             print(job.get("outline") or "(no plan was written)")
                         else:
-                            print(job["report"] or f"(no report: {job.get('error') or research.status(job)})")
+                            print(job["report"] or f"(no report: {job.get('error') or research.status(job, store)})")
                     else:
                         backend = search.current()
                         print(research.describe(backend))
@@ -309,6 +347,24 @@ def run_chat(providers: dict[str, Provider], provider_name: str, model: str | No
                             continue
                         print("\n" + job["report"] if job["status"] == "done" else f"error: {job.get('error') or job['status']}")
                         print(ui._dim("(saved; the assistant can use it in any conversation)"))
+                elif command == "/rules":
+                    _rules(agent)
+                elif command == "/read":
+                    if not agent.coding:
+                        raise ValueError("this is for coding tasks; start one with: private-ai code")
+                    named = agent.conversation["folders"]
+                    if arg.startswith("not "):
+                        folder = str(Path(arg[4:].strip()).expanduser().resolve())
+                        if folder not in named:
+                            raise ValueError(f"{folder} is not one of the folders")
+                        named.remove(folder)
+                    elif arg:
+                        folder = str(chosen_folder(arg, Path.cwd()))
+                        if folder not in named:
+                            named.append(folder)
+                    agent._use_folders()
+                    print(f"project: {agent.toolbox.project}")
+                    print("\n".join(f"  may also read: {f}" for f in named) or "  (no other folders)")
                 elif command == "/search":
                     if arg:
                         search.select(arg)
@@ -339,6 +395,6 @@ def run_chat(providers: dict[str, Provider], provider_name: str, model: str | No
             print(f"error: {e}")
         except KeyboardInterrupt:
             ui.end_line()
-            print("(interrupted; that message was not saved)")
+            print("(interrupted; what was done so far is saved)" if agent.partial else "(interrupted; that message was not saved)")
         ui.end_line()
         print()

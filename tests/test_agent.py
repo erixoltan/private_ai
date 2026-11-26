@@ -17,7 +17,10 @@ from private_ai.tools import Toolbox
 
 
 class FakeModel(BaseHTTPRequestHandler):
-    """Replies from a script: each entry is text, or a (tool, args) pair, or an HTTP error code."""
+    """Replies from a script: each entry is text, or a (tool, args) pair, or an
+    HTTP error code, or SILENT: a reply that begins and then says nothing more."""
+
+    SILENT = object()
 
     script: list = []
     requests: list = []
@@ -51,6 +54,14 @@ class FakeModel(BaseHTTPRequestHandler):
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
+            return
+        if step is FakeModel.SILENT:
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.end_headers()
+            self.wfile.write(b'data: {"choices": [{"delta": {"reasoning_content": "let me think"}}]}\n\n')
+            self.wfile.flush()
+            self.rfile.read(1)  # returns when the other end gives up
             return
         if isinstance(step, dict):  # a reply preceded by reasoning
             deltas = [{"reasoning_content": step["thinking"]}, {"content": step["text"]}]
@@ -88,6 +99,9 @@ class FakeUI:
 
     def notice(self, message):
         self.notices.append(message)
+
+    def status(self, doing):
+        self.statuses = [*getattr(self, "statuses", []), doing]
 
     def ask(self, question, choices):
         self.questions.append(question)
@@ -331,7 +345,7 @@ class FileToolTest(unittest.TestCase):
         self.assertIn("sent to cloudy (cloud)", self.ui.questions[0])
 
     def test_once_asks_again_but_folder_grant_does_not(self):
-        box = self.box(["y", "a"])
+        box = self.box(["y", "s"])
         self.assertEqual(self.call(box, "read_file", path=str(self.dir / "a.txt")), "A")
         self.assertEqual(self.call(box, "read_file", path=str(self.dir / "b.txt")), "B")
         self.assertEqual(self.call(box, "read_file", path=str(self.dir / "a.txt")), "A")
@@ -343,13 +357,13 @@ class FileToolTest(unittest.TestCase):
         outside.close()
         self.addCleanup(os.unlink, outside.name)
         (self.dir / "link.txt").symlink_to(outside.name)
-        box = self.box(["a", "n"])
+        box = self.box(["s", "n"])
         self.call(box, "list_directory", path=str(self.dir))
         result = self.call(box, "read_file", path=str(self.dir / "link.txt"))
         self.assertEqual(result, "Error: the user did not allow this.")
 
     def test_write_always_asks(self):
-        box = self.box(["a", "y", "n"])
+        box = self.box(["s", "y", "n"])
         self.call(box, "list_directory", path=str(self.dir))
         new = self.dir / "new.txt"
         self.assertEqual(self.call(box, "write_file", path=str(new), content="x"), "Written.")
@@ -358,8 +372,9 @@ class FileToolTest(unittest.TestCase):
         self.assertIn("REPLACE", self.ui.questions[-1])
 
     def test_config_folder_is_off_limits(self):
-        os.environ["PRIVATE_AI_CONFIG"] = str(self.dir / "cfg" / "config.toml")
-        self.addCleanup(os.environ.pop, "PRIVATE_AI_CONFIG")
+        patcher = unittest.mock.patch.dict(os.environ, {"PRIVATE_AI_CONFIG": str(self.dir / "cfg" / "config.toml")})
+        patcher.start()
+        self.addCleanup(patcher.stop)
         (self.dir / "cfg").mkdir()
         (self.dir / "cfg" / "config.toml").write_text('KEY = "secret"')
         box = self.box([])
@@ -401,7 +416,7 @@ class FileToolTest(unittest.TestCase):
 
     def test_secrets_are_asked_about_every_time_despite_a_folder_grant(self):
         home = self.at_home()
-        box = self.box(["a", "y", "n"])
+        box = self.box(["s", "y", "n"])
         self.call(box, "list_directory", path=str(home))
         self.assertEqual(self.call(box, "read_file", path=str(home / "notes.txt")), "N")
         self.assertEqual(self.call(box, "read_file", path=str(home / ".ssh" / "id_ed25519")), "KEY")
@@ -413,7 +428,7 @@ class FileToolTest(unittest.TestCase):
     def test_secret_file_names_are_flagged_anywhere(self):
         (self.dir / ".env").write_text("TOKEN=1")
         (self.dir / ".env.example").write_text("TOKEN=")
-        box = self.box(["a", "n"])
+        box = self.box(["s", "n"])
         self.call(box, "list_directory", path=str(self.dir))
         self.assertEqual(self.call(box, "read_file", path=str(self.dir / ".env.example")), "TOKEN=")
         self.assertIn("did not allow", self.call(box, "read_file", path=str(self.dir / ".env")))

@@ -231,11 +231,32 @@ class ResearchTest(ResearchCase):
         self.assertEqual(_queries('["one two", "three four", "five six"]', 2), ["one two", "three four"])
         self.assertEqual(_queries("[]", 5), [])
 
-    def test_a_job_cut_off_long_ago_counts_as_stopped(self):
+    def test_a_running_job_nobody_is_working_on_counts_as_interrupted(self):
         job = self.store.new_research("t")
-        job["updated"] = time.time() - research.STALE_AFTER - 1
-        self.assertEqual(research.status(job), "stopped")
-        self.assertEqual(research.status(job, live=True), "running")
+        self.store.save_research(job)
+        self.assertEqual(research.status(job, self.store), "interrupted")
+        self.assertEqual(research.status(job, self.store, live=True), "running")
+        claim = self.store.claim_research(job["id"])
+        self.assertEqual(research.status(job, self.store), "running")
+        self.assertIsNone(self.store.claim_research(job["id"]))  # one worker at a time
+        claim.close()  # what the system does when the program dies
+        self.assertEqual(research.status(job, self.store), "interrupted")
+        self.assertIn("interrupted", research.summary_line(job, self.store))
+
+    def test_a_job_being_worked_on_is_left_alone(self):
+        job = self.store.new_research("t")
+        self.store.save_research(job)
+        claim = self.store.claim_research(job["id"])
+        self.addCleanup(claim.close)
+        with self.assertRaises(research.Busy):
+            research.Research(self.provider, "m", self.store, BACKEND).run("t", job)
+        self.assertEqual(self.store.load_research(job["id"])["log"], [])
+
+    def test_the_claim_is_released_when_a_job_ends(self):
+        FakeModel.side_replies = ['["plums"]', "- note", "- note", "the plan", "# The plum report"]
+        job = self.run_job("When do plums ripen?", searches=1, pages=3)
+        self.assertEqual(job["status"], "done")
+        self.assertFalse(self.store.research_claimed(job["id"]))
 
 
 class ResearchToolTest(ResearchCase):

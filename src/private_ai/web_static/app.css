@@ -28,7 +28,7 @@
 [hidden] { display: none !important; }
 html, body { height: 100%; margin: 0; }
 body { display: flex; background: var(--bg); color: var(--text); font: 15px/1.5 system-ui, sans-serif; }
-button, select, textarea { font: inherit; color: inherit; }
+button, select, textarea, input { font: inherit; color: inherit; }
 button { padding: 6px 12px; border: 1px solid var(--line); border-radius: 6px; background: var(--bg); cursor: pointer; }
 button:hover { border-color: var(--accent); }
 button.quiet { border-color: transparent; background: none; color: var(--muted); }
@@ -47,7 +47,9 @@ button.quiet { border-color: transparent; background: none; color: var(--muted);
 .items .title { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .items .date { display: block; font-size: 12px; color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .items .date.running { color: var(--cloud); font-weight: 600; }
-.items .date.failed { color: var(--warn); }
+.items .date.failed, .items .date.interrupted { color: var(--warn); }
+#waiting h2 { margin: 0 0 4px; font-size: 13px; color: var(--cloud); }
+#waiting-list { flex: none; min-height: 0; max-height: 30vh; }
 .items .delete { border: 0; background: none; color: var(--muted); padding: 4px 8px; }
 .items .delete:hover { color: var(--warn); }
 
@@ -92,10 +94,39 @@ details.thinking div { white-space: pre-wrap; overflow-wrap: anywhere; margin-to
 .ask .choices { display: flex; flex-wrap: wrap; gap: 8px; }
 .ask.settled { border-color: var(--line); color: var(--muted); }
 
-#composer { display: flex; gap: 8px; padding: 12px 16px; border-top: 1px solid var(--line); }
-#input { flex: 1; resize: vertical; padding: 8px; border: 1px solid var(--line); border-radius: 6px; background: var(--bg); }
-#send { background: var(--accent); border-color: var(--accent); color: var(--bg); }
-#send:disabled { opacity: 0.5; cursor: default; }
+/* A coding task's folders: where it works and what else it may read. */
+#code-setup { display: grid; grid-template-columns: max-content 1fr; align-items: baseline; gap: 6px 12px;
+  padding: 8px 16px; border-bottom: 1px solid var(--line); font-size: 14px; }
+#code-setup input { width: 100%; padding: 4px 6px; border: 1px solid var(--line); border-radius: 6px;
+  background: var(--bg); font-family: ui-monospace, monospace; font-size: 13px; }
+#code-setup input:disabled { border-color: transparent; background: none; padding-left: 0; }
+#code-setup div { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
+#code-setup div input { flex: 1 1 260px; width: auto; }
+#code-folders { display: contents; list-style: none; }
+#code-folders li { padding: 1px 2px 1px 8px; border: 1px solid var(--line); border-radius: 6px;
+  font-family: ui-monospace, monospace; font-size: 13px; overflow-wrap: anywhere; }
+#code-folders .delete { border: 0; background: none; color: var(--muted); padding: 0 6px; }
+#code-folders .delete:hover { color: var(--warn); }
+#code-setup .hint { grid-column: 1 / -1; margin: 0; }
+#code-setup .hint.problem { color: var(--warn); }
+#composer { display: grid; grid-template-columns: 1fr auto; gap: 6px 8px; padding: 8px 16px 12px; border-top: 1px solid var(--line); }
+#status { grid-column: 1 / -1; display: flex; justify-content: flex-end; align-items: center; gap: 6px; margin: 0;
+  font-size: 13px; color: var(--muted); overflow-wrap: anywhere; text-align: right; }
+#status-dot { flex: none; width: 9px; height: 9px; border-radius: 50%; border: 1px solid var(--muted); }
+#status.working { color: var(--text); }
+#status.working #status-dot { border-color: var(--accent); background: var(--accent); animation: pulse 1.2s ease-in-out infinite; }
+#status.asking #status-dot, #status.quiet #status-dot { border-color: var(--cloud); background: var(--cloud); animation: none; }
+@keyframes pulse { 50% { opacity: 0.25; } }
+@media (prefers-reduced-motion: reduce) { #status-dot { animation: none !important; } }
+#input { resize: vertical; padding: 8px; border: 1px solid var(--line); border-radius: 6px; background: var(--bg); }
+/* The button says what pressing it would do: nothing to send, send what is typed, or stop the work. */
+#send, #stop { min-width: 76px; color: var(--bg); font-weight: 600; }
+#send { background: var(--accent); border-color: var(--accent); }
+#send.ready { background: var(--local); border-color: var(--local); }
+#stop { background: var(--warn); border-color: var(--warn); }
+#send:disabled, #stop:disabled { opacity: 0.5; cursor: default; }
+#code-free-row { grid-column: 1 / -1; display: flex; gap: 8px; align-items: baseline; font-size: 13px; color: var(--muted); }
+#code-setup #code-free { flex: none; width: auto; margin: 0; padding: 0; }
 
 dialog { width: min(560px, 92vw); border: 1px solid var(--line); border-radius: 10px; background: var(--bg); color: var(--text); }
 dialog::backdrop { background: rgba(0, 0, 0, 0.4); }

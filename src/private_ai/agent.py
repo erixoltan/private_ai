@@ -6,16 +6,19 @@ a UI object (see tools.UI) and calls send() for each thing the user says.
 
 from __future__ import annotations
 
-import os
+import re
 import time
+from pathlib import Path
 
 from private_ai import identity
 from private_ai.client import ProviderError, chat, chat_stream, check_model, local_models
 from private_ai.providers import Provider, config_path
 from private_ai.store import Store
-from private_ai.tools import TOOLS, UI, Toolbox, urls_in
+from private_ai.tools import UI, Stopped, Toolbox, urls_in
 
 MAX_TOOL_ROUNDS = 25
+MAX_CODING_ROUNDS = 100
+INTERRUPTED = "[This reply was cut off before it was finished. What was done up to here is saved.]"
 
 SYSTEM_PROMPT = """\
 You are a private, general-purpose assistant running on the user's own computer.
@@ -54,6 +57,52 @@ Research reports saved on this computer:
 What you remember about the user:
 {memory}
 """
+
+CODING_PROMPT = """
+You are working as a coding agent in the project at {project}. Relative paths
+start there, and commands run there.
+
+How to work:
+- Look before you change anything: `find_files` and `search_files` to find
+  what matters, `read_file` to read it. Do not guess at code you have not read.
+- Change files with `edit_file`, in small edits. Use `write_file` for new files.
+- Use `run_command` to run tests, builds, linters, git and the like. Commands
+  are stopped at a time limit, so start no servers and keep each run short:
+  give a program that pauses or prints slowly a way to switch that off, and
+  use it when testing. Nobody can type into a
+  command. To test a program that asks the user questions, give the answers
+  in `input`, one line for each, and run it several times with different
+  answers to try its different paths. Do not change such a program to stop
+  asking just so that it runs here.
+- After a change, check it: run the tests or the program. If something fails,
+  read the output and fix the cause.
+- The user approves file changes and commands according to their own rules, so
+  call the tool rather than asking in chat. If something is refused, do not
+  try to get the same effect another way; say what you needed and why.
+- Stay inside the project unless the user asks otherwise. Do not commit, push,
+  install software or delete things unless the user asked for that.
+- Finish by saying what you changed, how you checked it, and anything left undone.
+"""
+
+FOLDERS_NOTE = """
+The user has also let you read these folders, which hold code or material the
+project uses. Give their files by full path. Read them freely, but do not
+change anything in them unless the user asks. `find_files` and `search_files`
+with no folder given look in the project and in all of these.
+{folders}
+"""
+
+# What some models write when they mean to call a tool but get the form wrong.
+_CALL_AS_TEXT = re.compile(r"<tool_call>|</tool_call>|<function=|<\|tool_call|<function_call>|\[TOOL_CALLS\]")
+CALL_AS_TEXT_NOTE = (
+    "[Automatic note, not from the user] Your last message wrote a tool call out as text, so nothing was run. "
+    "If you want to use a tool, call it properly now, with complete and exact arguments. Otherwise answer the user."
+)
+EMPTY_NOTE = (
+    "[Automatic note, not from the user] Your last message was empty: you said nothing and called no tool. "
+    "Do what you intended now: call the tool, or answer the user."
+)
+MAX_CALL_RETRIES = 2
 
 SUMMARY_NOTE = """
 This conversation is long. Its earlier part is no longer shown to you; these
@@ -116,15 +165,42 @@ def pick_model(provider: Provider, model: str | None) -> str:
 
 
 class Agent:
-    def __init__(self, provider: Provider, model: str, store: Store, ui: UI, conversation: dict | None = None):
+    def __init__(
+        self,
+        provider: Provider,
+        model: str,
+        store: Store,
+        ui: UI,
+        conversation: dict | None = None,
+        coding: bool = False,
+        trust: str = "ask",
+        project: Path | None = None,
+        folders: tuple[Path, ...] = (),
+    ):
+        """project and folders are for a coding task: where it works, and what
+        else it may read. A saved conversation keeps the project it started in."""
+        self._cut = None  # ends the reply being read, while one is
         self.provider = provider
         self.model = model
         self.store = store
         self.ui = ui
-        self.toolbox = Toolbox(store, ui, provider)
         self.use_tools = True
         self.conversation = conversation or store.new_conversation()
+        # A coding conversation stays one, and stays with the project it was started in.
+        self.coding = coding or self.conversation.get("mode") == "code"
+        started_in = self.conversation.get("project")
+        if started_in and Path(started_in).is_dir():
+            project = Path(started_in)
+        self.toolbox = Toolbox(store, ui, provider, self.coding, trust, project if self.coding else None)
+        if self.coding:
+            named = [*self.conversation.get("folders", []), *(str(f) for f in folders)]
+            self.conversation.update(mode="code", project=str(self.toolbox.project), folders=list(dict.fromkeys(named)))
+        self._use_folders()
         self.toolbox.conversation_id = self.conversation["id"]
+        self.partial = False  # whether the last send() was cut off after saving some of its work
+        if self.conversation["messages"] and self.conversation["messages"][-1]["role"] == "tool":
+            # The program ended in the middle of a reply; close it so the history is one a model accepts.
+            self.conversation["messages"].append({"role": "assistant", "content": INTERRUPTED})
         # Addresses the user gave, or that searches returned, earlier in a resumed
         # conversation can still be opened without asking. Addresses that only
         # appear inside a fetched page are not included.
@@ -133,12 +209,17 @@ class Agent:
             if m["role"] == "user" or (m["role"] == "tool" and content.startswith(("Web search results", "News headlines"))):
                 self.toolbox.known_urls |= urls_in(content)
 
+    def _use_folders(self) -> None:
+        """The conversation says which folders may be read; an interface may have changed that."""
+        named = self.conversation.get("folders", []) if self.coding else []
+        self.toolbox.policy.folders = [Path(f) for f in named]
+
     def _system_message(self) -> dict:
         facts = self.store.memory()
         prompt = SYSTEM_PROMPT.format(
             date=time.strftime("%A, %B %-d, %Y"),
             year=time.strftime("%Y"),
-            cwd=os.getcwd(),
+            cwd=self.toolbox.cwd,
             memory="\n".join(f"- {f}" for f in facts) or "(nothing yet)",
             reports="\n".join(
                 f"- {j['topic']} ({time.strftime('%Y-%m-%d', time.localtime(j['created']))})"
@@ -146,6 +227,10 @@ class Agent:
             )
             or "(none yet)",
         )
+        if self.coding:
+            prompt += CODING_PROMPT.format(project=self.toolbox.project)
+            if self.toolbox.policy.folders:
+                prompt += FOLDERS_NOTE.format(folders="\n".join(f"- {f}" for f in self.toolbox.policy.folders))
         if self.conversation.get("summary"):
             prompt += SUMMARY_NOTE.format(summary=self.conversation["summary"])
         return {"role": "system", "content": prompt}
@@ -172,6 +257,7 @@ class Agent:
             return  # one enormous exchange; nothing older to fold away
         cut = next((i for i in cuts if estimate_tokens(messages[i:]) <= budget // 2), cuts[-1])
         self.ui.notice("this conversation is long; summarising the earlier part for the model")
+        self.ui.status("summarising the earlier part of the conversation")
         earlier = _transcript(messages[start:cut], 6000)
         if self.conversation.get("summary"):
             earlier = f"Notes on the part before this:\n{self.conversation['summary']}\n\n{earlier}"
@@ -205,16 +291,26 @@ class Agent:
     def _complete(self, messages: list[dict]) -> dict:
         # Saved reasoning is for the user to read; it is never sent back to a provider.
         messages = [{k: v for k, v in m.items() if k != "thinking"} for m in messages]
+        if self.toolbox.stopped():
+            raise Stopped
+        self.ui.status("waiting for the model")
         try:
-            return chat_stream(
+            reply = chat_stream(
                 self.provider,
                 messages,
                 self.model,
-                TOOLS if self.use_tools else None,
+                self.toolbox.tools if self.use_tools else None,
                 self.ui.text,
                 self.ui.thinking,
+                on_call=lambda name: self.ui.status(f"the model is writing a call to {name}"),
+                on_open=self._opened,
             )
+            if self.toolbox.stopped():
+                raise Stopped  # the reply was cut short, and is not to be taken for a whole one
+            return reply
         except ProviderError as e:
+            if self.toolbox.stopped():
+                raise Stopped from None
             # Some local models cannot call tools at all; carry on as plain chat.
             if self.use_tools and "tool" in str(e).lower() and "HTTP 400" in str(e):
                 self.use_tools = False
@@ -222,31 +318,72 @@ class Agent:
                 return self._complete(messages)
             raise
 
+    def _opened(self, cut) -> None:
+        self._cut = cut
+
+    def interrupt(self) -> None:
+        """Called from another thread once toolbox.stopped() says yes: stop
+        waiting for the model now, rather than at its next word."""
+        cut, self._cut = self._cut, None
+        if cut:
+            cut()
+
     def send(self, text: str) -> None:
-        """Handle one user message: stream the reply, running tools as the model asks."""
+        """Handle one user message: stream the reply, running tools as the model asks.
+
+        The conversation is saved after every round of tool calls, so a long
+        piece of work that is stopped or fails keeps what was done up to then.
+        A message that got no further than its first reply is dropped."""
         messages = self.conversation["messages"]
-        turn_start = len(messages)
+        kept = len(messages)  # how much of the conversation survives if this is cut off
         messages.append({"role": "user", "content": text})
         self.toolbox.new_message(text)
         self.toolbox.model = self.model
+        self._use_folders()
+        self.partial = False
+        self.conversation["provider"] = self.provider.name
+        self.conversation["model"] = self.model
+        rounds = MAX_CODING_ROUNDS if self.coding else MAX_TOOL_ROUNDS
+        # A reply that wrote a tool call as text, or was empty, is shown back to the model and not kept.
+        retries, again = 0, []
         try:
-            for _ in range(MAX_TOOL_ROUNDS):
+            for _ in range(rounds):
                 self._compact_if_needed()
-                reply = self._complete([self._system_message(), *self._visible()])
-                messages.append(reply)
+                reply = self._complete([self._system_message(), *self._visible(), *again])
+                again = []
                 calls = reply.get("tool_calls")
+                said = reply["content"].strip()
+                if not calls and self.use_tools and (not said or _CALL_AS_TEXT.search(said)):
+                    if retries < MAX_CALL_RETRIES:
+                        retries += 1
+                        problem = "wrote a tool call as text, so nothing was run" if said else "gave an empty reply"
+                        self.ui.notice(f"the model {problem}; asking it to try again")
+                        # What it was thinking is the only record of what an empty reply intended.
+                        shown = said or (reply.get("thinking") or "").strip()[-1000:] or "(nothing)"
+                        note = CALL_AS_TEXT_NOTE if said else EMPTY_NOTE
+                        again = [{"role": "assistant", "content": shown}, {"role": "user", "content": note}]
+                        continue
+                    if not said:
+                        self.ui.notice("the model gave an empty reply again; say continue, or try another model")
+                messages.append(reply)
                 if not calls:
                     break
                 for call in calls:
                     result = self.toolbox.run(call["function"]["name"], call["function"]["arguments"])
                     messages.append({"role": "tool", "tool_call_id": call["id"], "content": result})
+                kept, self.partial = len(messages), True
+                self.store.save(self.conversation)
             else:
-                self.ui.notice(f"stopped after {MAX_TOOL_ROUNDS} tool rounds")
+                self.ui.notice(f"stopped after {rounds} rounds of tool use; say continue to carry on")
+                messages.append({"role": "assistant", "content": INTERRUPTED})
         except BaseException:
-            # Failed or interrupted: drop the half-finished turn so history stays valid.
-            del messages[turn_start:]
+            # Failed or interrupted: go back to the last point where the history was whole.
+            del messages[kept:]
+            if self.partial:
+                messages.append({"role": "assistant", "content": INTERRUPTED})
+                self.store.save(self.conversation)
             raise
-        self.conversation["provider"] = self.provider.name
-        self.conversation["model"] = self.model
+        self.partial = False
         self.store.save(self.conversation)
+        self.ui.status("finishing")
         self._describe()

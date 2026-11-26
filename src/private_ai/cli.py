@@ -6,7 +6,7 @@ import argparse
 import sys
 import time
 
-from private_ai import research, search
+from private_ai import approvals, research, search
 from private_ai.client import ProviderError, chat, local_models
 from private_ai.providers import Provider, config_path, config_warnings, default_provider_name, load_providers
 
@@ -62,7 +62,7 @@ def run_research(providers: dict[str, Provider], args) -> int:
             print("error: no such research; see --list", file=sys.stderr)
             return 1
     if args.show:
-        print(job["report"] or f"(no report: {job.get('error') or research.status(job)})")
+        print(job["report"] or f"(no report: {job.get('error') or research.status(job, store)})")
         return 0
     if args.plan:
         print(job.get("outline") or "(no plan was written)")
@@ -70,8 +70,11 @@ def run_research(providers: dict[str, Provider], args) -> int:
     if args.retry and (job["report"] or not job.get("gathered")):
         print("error: only research that finished reading but has no report can be retried", file=sys.stderr)
         return 1
+    if args.retry and store.research_claimed(job["id"]):
+        print("error: that research is still being worked on", file=sys.stderr)
+        return 1
     if args.list or not (args.topic or job):
-        print("\n".join(f"{n:>2}. {research.summary_line(j)}" for n, j in enumerate(jobs, 1)) or "No research yet.")
+        print("\n".join(f"{n:>2}. {research.summary_line(j, store)}" for n, j in enumerate(jobs, 1)) or "No research yet.")
         return 0
     try:
         provider = ready(providers[args.provider or default_provider_name()])
@@ -108,15 +111,37 @@ def main(argv: list[str] | None = None) -> int:
     p_chat.add_argument(
         "--resume", nargs="?", const="latest", metavar="ID", help="continue the latest conversation, or the one with this id"
     )
+    p_code = sub.add_parser("code", help="work on the code in the current project, in this terminal")
+    p_code.add_argument("--provider", help="provider to use (default: default_provider in config, else local ollama)")
+    p_code.add_argument("--model", help="model to use (overrides config)")
+    p_code.add_argument(
+        "--resume", nargs="?", const="latest", metavar="ID", help="continue the latest conversation, or the one with this id"
+    )
+    p_code.add_argument(
+        "--read",
+        action="append",
+        default=[],
+        metavar="FOLDER",
+        help="a folder outside the project that may be read without asking, such as a library the project uses; "
+        "give it again for each folder",
+    )
     p_web = sub.add_parser("web", help="serve a web interface on this machine only, until you press Ctrl-C")
     p_web.add_argument("--port", type=int, default=8765, help="port on 127.0.0.1 (default: 8765)")
     p_web.add_argument(
         "--detached-timeout",
         type=float,
-        default=120,
+        default=0,
         metavar="SECONDS",
-        help="how long a reply may keep going after its browser tab is closed (default: 120)",
+        help="stop a reply left running this long with no browser tab watching it (default: 0, no limit)",
     )
+    for p in (p_chat, p_code, p_web):
+        p.add_argument(
+            "--trust",
+            choices=approvals.TRUST_LEVELS,
+            help="what is allowed without asking: ask (nothing; the default), project (reading and changing files "
+            "in the project), all (everything, including any command). Default: trust in the config file.",
+        )
+    sub.add_parser("approvals", help="show the approval rules in force in the current project")
     sub.add_parser("providers", help="show configured providers and search services, and their data policies")
     p_research = sub.add_parser("research", help="research a topic on the web and save a report with sources")
     p_research.add_argument("topic", nargs="?", help="the question to research")
@@ -145,15 +170,32 @@ def main(argv: list[str] | None = None) -> int:
     for warning in config_warnings():
         print(f"warning: {warning}", file=sys.stderr)
 
-    if args.command == "chat":
+    trust = getattr(args, "trust", None) or approvals.default_trust()
+    if trust not in approvals.TRUST_LEVELS:
+        print(f"config error: trust must be one of: {', '.join(approvals.TRUST_LEVELS)}", file=sys.stderr)
+        return 2
+
+    if args.command in ("chat", "code"):
         from private_ai.terminal import run_chat
 
-        return run_chat(providers, args.provider or default_provider_name(), args.model, args.resume)
+        coding = args.command == "code"
+        return run_chat(
+            providers, args.provider or default_provider_name(), args.model, args.resume, coding, trust,
+            getattr(args, "read", []),
+        )
 
     if args.command == "web":
         from private_ai.web import run_web
 
-        return run_web(providers, default_provider_name(), args.port, args.detached_timeout)
+        return run_web(providers, default_provider_name(), args.port, args.detached_timeout, trust)
+
+    if args.command == "approvals":
+        policy = approvals.Policy(approvals.find_project(), local=True, trust=trust)
+        print(f"project: {policy.project}\ntrust:   {policy.trust}\nrules:   {policy.path}")
+        print("\n".join(f"  {r.describe()}" for r in policy.rules() if r.source == "file") or "  (no saved rules)")
+        if policy.problem:
+            print(f"warning: {policy.problem}", file=sys.stderr)
+        return 0
 
     if args.command == "providers":
         for p in providers.values():

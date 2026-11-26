@@ -129,6 +129,10 @@ a list of sources: one is added for you."""
 )
 
 
+class Busy(ProviderError):
+    """Another run, here or in another program, is already working on this job."""
+
+
 class Stopped(Exception):
     """The user stopped the job."""
 
@@ -278,6 +282,15 @@ class Research:
         Given a job whose reading is already done, only the missing later steps are done."""
         topic = " ".join(topic.split())
         self.job = job or self.store.new_research(topic)
+        claim = self.store.claim_research(self.job["id"])
+        if claim is None:
+            raise Busy("this research is already being worked on")
+        try:
+            return self._work(topic)
+        finally:
+            claim.close()
+
+    def _work(self, topic: str) -> dict:
         self.job.update(provider=self.provider.name, model=self.model, search=self.backend.name, status="running")
         self.job.pop("error", None)
         self.fields = {"topic": topic}
@@ -325,20 +338,19 @@ class Research:
         return self.job
 
 
-STALE_AFTER = 20 * 60  # a "running" job not updated for this long was cut off
-
-
-def status(job: dict, live: bool = False) -> str:
-    """A job's status, treating one that was cut off (program closed, power lost) as stopped."""
-    if job["status"] == "running" and not live and time.time() - job.get("updated", job["created"]) > STALE_AFTER:
-        return "stopped"
+def status(job: dict, store: Store, live: bool = False) -> str:
+    """A job's status. One saved as running that no program is working on any
+    more (the program was closed, or the power went) is "interrupted". Pass
+    live=True for a job this program has just started."""
+    if job["status"] == "running" and not live and not store.research_claimed(job["id"]):
+        return "interrupted"
     return job["status"]
 
 
-def summary_line(job: dict) -> str:
+def summary_line(job: dict, store: Store) -> str:
     day = time.strftime("%Y-%m-%d %H:%M", time.localtime(job["created"]))
     topic = job["topic"] if len(job["topic"]) <= 90 else job["topic"][:90].rsplit(" ", 1)[0] + " ..."
-    return f"{day}  {status(job):<8} {len(job['sources']):>2} sources  {(job.get('emoji') or '') + ' ' if job.get('emoji') else ''}{topic}"
+    return f"{day}  {status(job, store):<11} {len(job['sources']):>2} sources  {(job.get('emoji') or '') + ' ' if job.get('emoji') else ''}{topic}"
 
 
 def describe(backend: search.SearchBackend, searches: int = DEFAULT_SEARCHES, pages: int = DEFAULT_PAGES) -> str:

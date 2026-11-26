@@ -8,7 +8,12 @@
 </head>
 <body>
 <aside id="sidebar">
+  <section id="waiting" hidden>
+    <h2>Waiting for you</h2>
+    <ul id="waiting-list" class="items"></ul>
+  </section>
   <button id="new" type="button">New conversation</button>
+  <button id="new-code" type="button">New coding task</button>
   <ul id="conversations" class="items"></ul>
   <button id="research-open" type="button">New research</button>
   <ul id="research-list" class="items"></ul>
@@ -24,6 +29,21 @@
     <p id="search-policy"></p>
   </header>
   <div id="title-bar"><span id="title-emoji"></span><h1 id="title"></h1></div>
+  <section id="code-setup" hidden>
+    <label for="code-project">Project folder</label>
+    <input id="code-project" list="folder-options" autocomplete="off" spellcheck="false">
+    <span>May also read</span>
+    <div>
+      <ul id="code-folders"></ul>
+      <input id="code-folder" list="folder-options" autocomplete="off" spellcheck="false"
+        placeholder="Add a folder, such as a library the project uses" aria-label="Folder to add">
+      <button id="code-folder-add" type="button">Add</button>
+    </div>
+    <label id="code-free-row"><input id="code-free" type="checkbox"> Run commands in this task without asking,
+      until private-ai stops. For walking away from a test-and-fix loop; a command can do anything you can.</label>
+    <p class="hint" id="code-hint"></p>
+    <datalist id="folder-options"></datalist>
+  </section>
   <section id="transcript" aria-live="polite"></section>
   <section id="research-view" hidden>
     <p id="research-question"></p>
@@ -31,6 +51,7 @@
     <pre id="research-report"></pre>
   </section>
   <form id="composer">
+    <p id="status" role="status"><span id="status-dot"></span><span id="status-text">Idle</span></p>
     <textarea id="input" rows="2" placeholder="Message (Enter to send, Shift+Enter for a new line)"></textarea>
     <button id="send" type="submit">Send</button>
     <button id="stop" type="button" hidden>Stop</button>
@@ -45,7 +66,7 @@
 <dialog id="research">
   <h2>New research</h2>
   <p class="hint">The research agent searches, reads and writes a report with its sources. It keeps working while you
-    do other things, for as long as this program is running.</p>
+    do other things, even with this page closed, for as long as private-ai web is running.</p>
   <form id="research-form">
     <textarea id="research-topic" rows="3" placeholder="What should be researched? State it fully."></textarea>
     <button type="submit">Start</button>

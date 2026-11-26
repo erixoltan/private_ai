@@ -18,6 +18,7 @@ import contextlib
 import http.client
 import json
 import re
+import socket
 import urllib.error
 import urllib.request
 
@@ -194,6 +195,15 @@ def chat(
         raise ProviderError(f"unexpected response shape: {json.dumps(data)[:300]}") from None
 
 
+def _cut(resp) -> None:
+    """End a response another thread is reading. Closing it would not wake a
+    read that is waiting; shutting the socket down does."""
+    try:
+        resp.fp.raw._sock.shutdown(socket.SHUT_RDWR)
+    except (AttributeError, OSError):
+        pass  # already over
+
+
 def chat_stream(
     provider: Provider,
     messages: list[dict],
@@ -201,15 +211,23 @@ def chat_stream(
     tools: list[dict] | None = None,
     on_text: Callable[[str], None] = lambda delta: None,
     on_thinking: Callable[[str], None] = lambda delta: None,
-    timeout: float = 300,
+    timeout: float = 600,
+    on_call: Callable[[str], None] = lambda name: None,
+    on_open: Callable[[Callable[[], None]], None] = lambda cut: None,
 ) -> dict:
     """Stream a chat completion. Calls on_text for each piece of the reply and
     on_thinking for each piece of the model's reasoning, and returns the
     complete assistant message, including any tool calls.
 
     Reasoning is returned under the non-standard key "thinking". It is for
-    display only: remove it before sending the message back to a provider."""
-    model = check_model(provider, model, timeout)
+    display only: remove it before sending the message back to a provider.
+
+    timeout is how long the provider may send nothing at all: a model writing
+    a long tool call can be silent for minutes. on_call is given the name of
+    each tool the model starts to call. on_open is given a function that cuts
+    the connection from another thread, which ends the stream where it is;
+    the caller then knows the message is not whole."""
+    model = check_model(provider, model, min(timeout, 30))
     body: dict = {"model": model, "messages": messages, "stream": True}
     if tools:
         body["tools"] = tools
@@ -219,6 +237,7 @@ def chat_stream(
     calls: list[dict] = []
     slots: dict[int, dict] = {}  # stream index -> call being assembled
     with _open(provider, provider.base_url + "/chat/completions", body, timeout) as resp:
+        on_open(lambda: _cut(resp))
         for raw in resp:
             line = raw.decode("utf-8", "replace").strip()
             if not line.startswith("data:"):
@@ -246,6 +265,8 @@ def chat_stream(
                         call = slots[index] = {"id": "", "name": "", "arguments": ""}
                         calls.append(call)
                     fn = part.get("function") or {}
+                    if fn.get("name") and not call["name"]:
+                        on_call(fn["name"])
                     call["id"] = call["id"] or part.get("id") or ""
                     call["name"] += fn.get("name") or ""
                     call["arguments"] += fn.get("arguments") or ""

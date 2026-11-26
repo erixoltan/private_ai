@@ -11,6 +11,7 @@ Files are created readable only by the user.
 
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import json
 import os
@@ -231,7 +232,7 @@ class Store:
         return {
             "id": f"{stamp}-{secrets.token_hex(2)}",
             "topic": topic,
-            "status": "running",  # then done, failed or stopped
+            "status": "running",  # then done, failed or stopped; see research.status for "interrupted"
             "created": now,
             "finished": None,
             "queries": [],
@@ -256,6 +257,32 @@ class Store:
 
     def delete_research(self, research_id: str) -> None:
         self._research_path(research_id).unlink(missing_ok=True)
+        self._research_path(research_id).with_suffix(".lock").unlink(missing_ok=True)
+
+    def claim_research(self, research_id: str):
+        """Mark a job as being worked on by this process. Returns something to
+        close when the work ends, or None if the job is already being worked on.
+
+        It is a lock on a file, which the system releases by itself if the
+        process dies, so a job that was cut off never looks as if it is running.
+        """
+        handle = open(self._research_path(research_id).with_suffix(".lock"), "a")
+        try:
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            handle.close()
+            return None
+        return handle
+
+    def research_claimed(self, research_id: str) -> bool:
+        """Whether some running program, this one or another, is working on the job."""
+        if not self._research_path(research_id).with_suffix(".lock").exists():
+            return False
+        handle = self.claim_research(research_id)
+        if handle is None:
+            return True
+        handle.close()
+        return False
 
     def list_research(self) -> list[dict]:
         """All research jobs, newest first."""

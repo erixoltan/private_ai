@@ -23,7 +23,8 @@ Privacy properties this module is responsible for:
 * Starting a job is the user's approval for a stated number of searches with a
   named search service. The job never exceeds that number.
 * Pages are fetched directly, with the same rules as in chat. A page that
-  refuses is skipped; no third-party reading service is used.
+  refuses is read with the browser on this machine if there is one, and
+  otherwise skipped; no third-party reading service is used.
 * The report, its notes and every page read are stored on this machine.
 """
 
@@ -37,7 +38,7 @@ from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from urllib.parse import urlsplit
 
-from private_ai import identity, search
+from private_ai import browser, identity, search
 from private_ai.client import ProviderError, chat
 from private_ai.fetch import FetchError, read_page
 from private_ai.providers import Provider
@@ -236,7 +237,13 @@ class Research:
             try:
                 return read_page(result["url"])
             except FetchError as e:
-                return str(e)
+                # The browser is on this machine, so it is not the third party the job promised not to use.
+                if not browser.shared():
+                    return str(e)
+                try:
+                    return browser.read_page(result["url"])
+                except FetchError as again:
+                    return f"{e}; the browser could not read it either: {again}"
 
         self.pages_left -= len(results)
         with ThreadPoolExecutor(max_workers=4) as pool:

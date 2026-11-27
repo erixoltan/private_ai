@@ -23,6 +23,7 @@ _SECRET_HOME = (
     ".ssh", ".gnupg", ".aws", ".azure", ".kube", ".docker", ".password-store",
     ".config/gcloud", ".config/gh", ".config/op", ".local/share/keyrings",
     ".mozilla", ".thunderbird", ".config/google-chrome", ".config/chromium",
+    "snap/firefox", "snap/chromium", "snap/thunderbird", ".local/share/private_ai/browser",
     ".config/BraveSoftware", ".config/microsoft-edge",
     ".netrc", ".npmrc", ".pypirc", ".git-credentials", ".pgpass", ".my.cnf",
 )

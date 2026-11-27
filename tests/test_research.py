@@ -143,6 +143,26 @@ class ResearchTest(ResearchCase):
         self.assertEqual([u["url"] for u in job["unread"]], ["https://site3.example/plums"])
         self.assertEqual(len(job["sources"]), 2)
 
+    def test_a_page_that_refuses_is_read_with_the_browser_when_there_is_one(self):
+        FakeModel.side_replies = ['["plums"]', "- note", "- note", "- note", "the plan", "the report"]
+        opened = []
+
+        def with_browser(url):
+            opened.append(url)
+            return url, "Read by the browser", PAGE_TEXT
+
+        with mock.patch.multiple(research.browser, shared=lambda: object(), read_page=with_browser):
+            job = self.run_job(searches=1, pages=3)
+        self.assertEqual(opened, ["https://site3.example/plums"])  # only the one that refused
+        self.assertEqual((job["unread"], len(job["sources"])), ([], 3))
+
+    def test_a_page_the_browser_cannot_read_either_is_recorded_with_both_reasons(self):
+        FakeModel.side_replies = ['["plums"]', "- note", "- note", "the plan", "the report"]
+        failing = mock.Mock(side_effect=FetchError("it may need a login"))
+        with mock.patch.multiple(research.browser, shared=lambda: object(), read_page=failing):
+            job = self.run_job(searches=1, pages=3)
+        self.assertEqual(job["unread"][0]["problem"], "the site answered 403 Forbidden; the browser could not read it either: it may need a login")
+
     def test_nothing_readable_is_a_failure_with_a_reason(self):
         FakeModel.side_replies = ['["plums"]'] + ["NOTHING"] * 5
         job = self.run_job(searches=1, pages=3)

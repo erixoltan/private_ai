@@ -111,9 +111,11 @@ What leaves your machine, and when you are asked:
   from a search or news result. For any other address, which the model made
   up, you are asked first.
 * **Pages that refuse.** Many sites block programs, and pages built by
-  JavaScript come back empty. If you have an Ollama key you are offered
-  Ollama's page-reading service, which would see the address. Otherwise the
-  agent uses the excerpt from the search result and says so.
+  JavaScript come back empty. Such a page is opened in the assistant's own
+  browser instead (see The browser). If that fails too and you have an Ollama
+  key, you are offered Ollama's page-reading service, which would see the
+  address. Otherwise the agent uses the excerpt from the search result and
+  says so.
 * **Limits.** At most 6 searches and 8 pages per message.
 
 Every page read is saved in `~/.local/share/private_ai/pages/`, so the agent
@@ -121,6 +123,52 @@ can find it again in later conversations. Text from the web is marked as
 untrusted before the model sees it, but no marking makes a model immune to a
 page written to mislead it. That is why file changes and commands go through
 your approval rules (see Approvals), and why a wide rule deserves thought.
+
+## The browser
+
+When a page cannot be read plainly, the assistant opens it in Firefox, lets it
+finish building itself, and reads what is there. This needs Firefox installed
+and nothing else. It happens by itself in conversations and in research; the
+model can also ask for it when a plain copy was clearly not the whole page.
+
+    private-ai browser                     # open the assistant's browser as a window
+    private-ai browser https://example.org/login
+    private-ai browser --read URL          # print a page as the assistant would read it
+
+* **A profile of its own.** The assistant's browser is separate from the one
+  you browse with. It starts signed in to nothing, and your everyday history,
+  passwords and sessions are out of its reach.
+* **You sign in, not the assistant.** `private-ai browser` opens that profile
+  as an ordinary window. Sign in there to the sites the assistant should be
+  able to read, and close it. From then on a page on those sites is read as
+  you would see it, so sign in only where you want that. Passwords are not
+  saved in the profile; the sign-in itself (the site's cookies) is. The
+  assistant cannot use the browser while the window is open.
+* **It only looks.** The assistant can open an address and read the page. It
+  cannot click, type or submit anything. The rule for addresses is the same as
+  before: one that came from you or from a search or news result is read, and
+  for any other you are asked.
+* **A page runs.** Unlike plain reading, the site sees an ordinary browser:
+  its scripts run, it loads what it likes from other sites, and this profile's
+  cookies are sent. A page is closed as soon as it has been read.
+* **Public sites only.** The browser is set up to refuse this machine and the
+  local network, including when a page redirects there or tries to load
+  something from there.
+* **No window, and not left running.** It runs out of sight and is closed
+  after two minutes without use.
+
+Settings, if you need them, go under `[browser]` in the config file:
+`enabled = false` turns it off, `firefox = "/path/to/firefox"` names the
+program, `profile = "/path"` moves the profile, and `headless = false` shows
+the window while the assistant reads. The profile is in
+`~/.local/share/private_ai/browser/`, or, when Firefox is the snap package
+(as on Ubuntu), in `~/snap/firefox/common/private_ai-browser/`, the only place
+that package can use.
+
+Some sites detect a remote-controlled browser and show a captcha instead of
+the page. The assistant does not answer those. It tells you, and you can open
+the page with `private-ai browser URL` and answer it yourself; the site may
+then let later reads through, though some never do.
 
 To run SearXNG on this machine only, with Docker:
 
@@ -177,8 +225,10 @@ it.
 * **The researcher sees only the topic.** It is not given your memory,
   conversations or files, so nothing private can end up in a search query
   unless you wrote it in the topic.
-* **Pages that refuse are skipped**, and listed in the saved job. No
-  third-party reading service is used.
+* **Pages that refuse are read with the browser**, if there is one, which is
+  on this machine and uses the sign-ins you gave it. Those it cannot read
+  either are skipped, and listed in the saved job. No third-party reading
+  service is used.
 * **A job that was cut off is marked interrupted**, whether the program was
   closed or the computer went off. If it had finished reading, the report can
   be written from the saved notes (`--retry`, or "Write the report again").
@@ -199,7 +249,8 @@ contents of a new file, or the lines that change in an existing one.
 
 * The folder holding your API keys and approval rules is always off limits.
 * The assistant cannot write to its own data folder with the file tools.
-* Places that usually hold secrets (`~/.ssh`, `~/.aws`, browser profiles,
+* Places that usually hold secrets (`~/.ssh`, `~/.aws`, browser profiles
+  including the assistant's own,
   `.env` files, private keys and the like) are asked about every time, with a
   warning, whatever you have approved.
 * Writing a file the system runs by itself (`~/.bashrc`, autostart entries,

@@ -153,6 +153,11 @@ def main(argv: list[str] | None = None) -> int:
     p_research.add_argument("--model", help="model to use (overrides config)")
     p_research.add_argument("--searches", type=int, default=research.DEFAULT_SEARCHES, help="most searches to send")
     p_research.add_argument("--pages", type=int, default=research.DEFAULT_PAGES, help="most pages to read")
+    p_browser = sub.add_parser(
+        "browser", help="open the assistant's own browser as a window, to sign in to sites it should be able to read"
+    )
+    p_browser.add_argument("url", nargs="?", help="a page to open")
+    p_browser.add_argument("--read", action="store_true", help="instead, print the page as the assistant would read it")
     p_search = sub.add_parser("search", help="run one web search and print the results (a test of a search service)")
     p_search.add_argument("query")
     p_search.add_argument("--with", dest="backend", metavar="NAME", help="search service to use (default: the one chat uses)")
@@ -216,6 +221,24 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "research":
         return run_research(providers, args)
 
+    if args.command == "browser":
+        from private_ai import browser
+
+        try:
+            if args.read:
+                if not args.url:
+                    parser.error("--read needs the address of a page")
+                final_url, title, text = browser.read_page(args.url)
+                print(f"{title}\n{final_url}\n\n{text}")
+                return 0
+            program = browser.firefox_program()
+            print(f"Profile: {browser.profile_dir(program)}")
+            print("Sign in to the sites the assistant should be able to read, then close the window.")
+            print("It cannot read with this browser while the window is open.")
+            return browser.open_window(args.url)
+        except browser.FetchError as e:
+            print(f"error: {e}", file=sys.stderr)
+            return 1
     if args.command == "search":
         try:
             backend = search.select(args.backend) if args.backend else search.current()

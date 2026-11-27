@@ -55,6 +55,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Protocol
 
+from private_ai import browser as browser_module
 from private_ai import research, search, sensitive
 from private_ai.approvals import Policy, find_project
 from private_ai.client import ProviderError
@@ -149,8 +150,12 @@ TOOLS = [
     _tool(
         "fetch_page",
         "Read a web page as text. Use an address exactly as it appeared in a search or news result or in the "
-        "user's message; for any other address the user is asked first. The page is saved for later.",
+        "user's message; for any other address the user is asked first. The page is saved for later. A page "
+        "that cannot be read plainly is opened in a real browser by itself. If what came back is plainly not "
+        "the whole page (a menu and little else, or a notice to turn on JavaScript), ask again with browser set.",
+        optional=("browser",),
         url="The full address, starting with https://",
+        browser="Set to yes to read the page with the real browser from the start.",
     ),
     _tool(
         "search_saved_pages",
@@ -383,7 +388,7 @@ class Toolbox:
             lines.append(f"- {i['title']} [{i['source']}, {search.day(i['time'])}]\n  {i['url']}\n  {i['snippet']}")
         return "\n".join(lines)
 
-    def _fetch_page(self, url: str) -> str:
+    def _fetch_page(self, url: str, browser: str = "") -> str:
         url = url.strip()
         if self.pages >= MAX_PAGES_PER_MESSAGE:
             limit = MAX_PAGES_PER_MESSAGE
@@ -399,6 +404,8 @@ class Toolbox:
             self.known_urls.add(url)
         self.pages += 1
         try:
+            if browser.strip().lower() in ("yes", "true", "1"):
+                raise FetchError("the plain copy was not the whole page")
             final_url, title, text = read_page(url)
             self.ui.notice(f"read {final_url}")
         except FetchError as problem:
@@ -408,7 +415,16 @@ class Toolbox:
         return self._page_text(final_url, title, text)
 
     def _read_another_way(self, url: str, problem: str) -> tuple[str, str]:
-        """When the site will not give us the page: a reading service, if the user agrees, else our saved copy."""
+        """When the site will not give us the page plainly: the browser on this
+        machine, then a reading service if the user agrees, then our saved copy."""
+        if browser_module.shared():
+            self.ui.status(f"reading with the browser: {url[:120]}")
+            try:
+                _, title, text = browser_module.read_page(url)
+                self.ui.notice(f"read {url} with the browser")
+                return title, text
+            except FetchError as e:
+                problem = f"{problem}; the browser could not read it either: {e}"
         reader = search.load_backends().get("ollama")
         if reader and reader.ready:
             if not self.reader_approved:

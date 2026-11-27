@@ -22,7 +22,14 @@ Privacy and safety properties this module is responsible for:
   is opened and again where the page ended up, and the profile is set up so
   that Firefox itself refuses to connect to this machine or the local network,
   which covers redirects and whatever a page tries to load.
-* The assistant can only look. Nothing here clicks, types or submits.
+* Reading a page (read) only looks: nothing is clicked, typed or submitted,
+  and the page is closed once it is read.
+* A page can also be opened to be used (open, click, fill). This module does
+  what it is told there; whether the assistant may click or type is decided
+  by the caller, with the user's approval rules (tools.py). Two things are
+  refused here whatever the caller says: typing into a password or payment
+  card field, and choosing a file to upload. Signing in is for the user.
+* A page that is open to be used keeps running until the browser closes.
 * Text from a page is as untrusted as any other text from the web.
 
 Settings, in the config file:
@@ -60,6 +67,9 @@ START_SECONDS = 40  # a first start creates the profile, which is slow
 LOAD_SECONDS = 30
 SETTLE_SECONDS = 8  # how long a page is given to finish building itself after it has loaded
 IDLE_SECONDS = 120  # the browser is closed when it has not been used for this long
+PAGE_IDLE_SECONDS = 900  # or this long, while a page is open to be used: a slow model thinks between steps
+MAX_VIEW_CHARS = 400_000
+ELEMENT = "element-6066-11e4-a52e-4f735466cecf"  # how the browser names a thing on a page it has handed over
 MAX_HTML_CHARS = 3_000_000
 
 # Sent to nothing on this machine or the local network, whatever a page asks for. Firefox
@@ -108,6 +118,8 @@ _PREFS = {
     "network.proxy.no_proxies_on": "",
     "network.proxy.allow_hijacking_localhost": True,
     "network.proxy.failover_direct": False,
+    "browser.link.open_newwindow": 1,  # a link that wants a new window opens where it was clicked
+    "browser.link.open_newwindow.restriction": 0,
 }
 
 # What the page shows, when the HTML alone does not say (text drawn into the page by scripts in odd ways).
@@ -115,6 +127,116 @@ _SHOWN = "return [document.title, document.body ? document.body.innerText : '']"
 _SIZE = "return document.body ? document.body.innerText.length : 0"
 _HTML = "return document.documentElement ? document.documentElement.outerHTML.slice(0, arguments[0]) : ''"
 
+
+# The page as text, with everything that can be clicked or filled in marked with a number.
+# Returns [title, text, the things themselves, what each one is].
+_VIEW = r"""
+/* private_ai: view */
+const out = [], els = [], info = [];
+let line = "", inside = 0;
+const clean = (s, n) => String(s || "").replace(/\s+/g, " ").trim().slice(0, n);
+const flush = () => { const t = clean(line, 100000).replace(/ ([,.;:!?])/g, "$1"); if (t) out.push(t); line = ""; };
+const named = el => {
+  let s = el.getAttribute("aria-label") || "";
+  if (!s && el.labels && el.labels.length) s = el.labels[0].innerText;
+  return clean(s || el.getAttribute("placeholder") || el.getAttribute("title") || el.getAttribute("alt") || el.getAttribute("name") || "", 80);
+};
+const secret = el => el.type == "password" || /^cc-|password/.test(el.getAttribute("autocomplete") || "")
+  || /card.?num|cvv|cvc|passw|security.?code/i.test((el.name || "") + " " + (el.id || ""));
+function kind(el, cs) {
+  const tag = el.tagName, role = el.getAttribute("role") || "", type = (el.getAttribute("type") || "").toLowerCase();
+  if (tag == "A" && el.hasAttribute("href")) return "link";
+  if (tag == "BUTTON" || tag == "SUMMARY" || tag == "INPUT" && /^(submit|button|reset|image)$/.test(type)) return "button";
+  if (tag == "INPUT") return type == "hidden" ? "" : type == "checkbox" || type == "radio" ? type : type == "file" ? "file" : "field";
+  if (tag == "TEXTAREA" || el.isContentEditable && !(el.parentElement && el.parentElement.isContentEditable)) return "field";
+  if (tag == "SELECT") return "list";
+  if (role == "link") return "link";
+  if (/^(button|tab|menuitem|option|switch|checkbox|radio)$/.test(role) || el.hasAttribute("onclick")) return "button";
+  if (!inside && cs.cursor == "pointer" && el.parentElement && getComputedStyle(el.parentElement).cursor != "pointer") return "button";
+  return "";
+}
+function walk(node) {
+  if (node.nodeType == 3) { line += node.nodeValue; return; }
+  if (node.nodeType != 1) return;
+  const tag = node.tagName;
+  if (/^(SCRIPT|STYLE|NOSCRIPT|TEMPLATE|HEAD|SVG|IFRAME|OBJECT|CANVAS|VIDEO|AUDIO)$/i.test(tag)) return;
+  if (tag == "BR") { flush(); return; }
+  const cs = getComputedStyle(node);
+  if (cs.display == "none" || cs.visibility == "hidden" || cs.visibility == "collapse") return;
+  if (tag == "IMG") { const alt = clean(node.alt, 80); if (alt) line += " " + alt + " "; return; }
+  const cell = cs.display == "table-cell";
+  const block = !cell && !/^(inline|contents|ruby)/.test(cs.display);
+  if (block) flush(); else line += cell ? " | " : cs.display == "inline" ? "" : " ";
+  const k = kind(node, cs);
+  let counted = false;
+  if (k == "file") {
+    line += " [file chooser: not for you to use] ";
+  } else if (k) {
+    const off = node.disabled || node.getAttribute("aria-disabled") == "true";
+    const item = {kind: k, label: "", href: "", secret: false, risky: false, many: false};
+    let shown = "", descend = false;
+    if (k == "link" || k == "button") {
+      const text = clean(node.innerText, 400);
+      item.href = k == "link" && node.href ? String(node.href).slice(0, 500) : "";
+      const picture = node.querySelector("img[alt]");
+      item.label = clean(text || node.value, 120) || named(node) || clean(picture && picture.alt, 80)
+        || clean(item.href.replace(/[?#].*/, "").replace(/\/$/, "").split("/").pop(), 60);
+      item.risky = !!(node.form && node.form.querySelector("input[type=password], [autocomplete^=cc-]"));
+      descend = text.length > 120;
+      shown = descend ? "" : ' "' + item.label + '"';
+    } else {
+      item.label = named(node);
+      item.secret = k == "field" && secret(node);
+      item.many = node.tagName == "TEXTAREA" || node.isContentEditable;
+      shown = item.label ? ' "' + item.label + '"' : "";
+      if (k == "checkbox" || k == "radio") shown += node.checked ? ", on" : ", off";
+      else if (k == "list") {
+        const chosen = node.selectedOptions && node.selectedOptions[0];
+        shown += ' = "' + clean(chosen && chosen.text, 60) + '", choices: ' + Array.from(node.options).slice(0, 40).map(o => clean(o.text, 60)).join(" | ");
+      }
+      else if (item.secret) shown += ", secret: only the user may fill this in";
+      else shown += ' = "' + clean(node.isContentEditable ? node.innerText : node.value, 200) + '"';
+    }
+    if (off) line += " [" + k + shown + ", switched off] ";
+    else { els.push(node); info.push(item); line += " [" + els.length + " " + k + shown + "] "; }
+    if (!descend) { if (block) flush(); return; }
+    inside++; counted = true;
+  }
+  for (const kid of (node.shadowRoot ? node.shadowRoot.childNodes : node.childNodes)) walk(kid);
+  if (counted) inside--;
+  if (block) flush();
+}
+walk(document.body || document.documentElement);
+flush();
+return [document.title, out.join("\n").slice(0, arguments[0]), els, info];
+"""
+
+# For a page being used: whether it has finished loading, and how much it shows.
+_READY = "/* private_ai: ready */ return [document.readyState, document.body ? document.body.innerText.length : 0]"
+
+# Choose from a list by what the choice says.
+_CHOOSE = r"""
+/* private_ai: choose */
+const list = arguments[0], want = String(arguments[1]).replace(/\s+/g, " ").trim().toLowerCase();
+const says = o => o.text.replace(/\s+/g, " ").trim().toLowerCase();
+const options = Array.from(list.options);
+const option = options.find(o => says(o) == want) || options.find(o => o.value.toLowerCase() == want) || options.find(o => says(o).includes(want));
+if (!option) return false;
+list.value = option.value;
+list.dispatchEvent(new Event("input", {bubbles: true}));
+list.dispatchEvent(new Event("change", {bubbles: true}));
+return true;
+"""
+
+_HAS_CHALLENGE = "return document.documentElement ? document.documentElement.outerHTML.slice(0, 500000) : ''"
+
+# Words on a button or link that mean something is bought, sent, made public or destroyed.
+_CONSEQUENTIAL = re.compile(
+    r"\b(buy|pay|purchase|place (my |your |the )?order|order now|complete (my |your |the )?order|checkout|check out|"
+    r"subscribe|unsubscribe|donate|delete|send|submit|post|publish|confirm|transfer|book now|reserve|sign up|"
+    r"register|create (an |my |your )?account|log ?out|sign ?out)\b",
+    re.I,
+)
 
 _CHALLENGE = re.compile(r"captcha|cf-chl|challenge-platform|are you a robot|verify you are human", re.I)
 
@@ -186,11 +308,51 @@ def _check_public(url: str, allow_private: bool) -> None:
 
 def _plainly(message: str) -> str:
     """What the browser said went wrong, in words fit to show."""
+    low = message.lower()
+    if "stale" in low or "no longer attached" in low or "is not known in the current browsing context" in low:
+        return "that is no longer on the page, which has changed; look at the page again for the new numbers"
+    if "obscures it" in low:
+        return f"something on the page is in the way, such as a notice that has to be answered first ({message[:300]})"
+    if "not be scrolled into view" in low or "not interactable" in low or "not reachable by keyboard" in low:
+        return "that cannot be used as the page is now: it is hidden or not ready. Look at the page again"
     if "proxyConnectFailure" in message:  # how _PUBLIC_ONLY's refusal comes back
         return "the address is on this machine or the local network; only public sites can be opened"
     if "about:neterror?e=" in message:
         return f"the page could not be opened ({message.split('about:neterror?e=')[1].split('&')[0]})"
     return message[:300] or "the browser reported an error"
+
+
+def consequential(item: dict) -> str | None:
+    """Why a click on this deserves a second look from the user, if it does.
+    Judged from the words on it, so it is a help, not a guarantee."""
+    if item.get("risky"):
+        return "It belongs to a form with a password or payment card field."
+    found = _CONSEQUENTIAL.search(item.get("label") or "")
+    if found:
+        return f"It says \"{found[0]}\": it may buy, send, publish, delete or sign up for something, and that may not be undoable."
+    return None
+
+
+class View:
+    """A page as the assistant sees it: its text, with the things on it that can be used."""
+
+    def __init__(self, url: str, title: str, text: str, items: list[dict]):
+        self.url, self.title, self.text, self.items = url, title, text, items
+
+    @property
+    def host(self) -> str:
+        return urlsplit(self.url).hostname or ""
+
+    def item(self, number: str | int) -> dict:
+        try:
+            n = int(str(number).strip().strip("[]"))
+            if n < 1:
+                raise ValueError
+            return self.items[n - 1]
+        except (ValueError, IndexError):
+            raise BrowserError(
+                f"there is no number {number} on the page as it was last shown (it has {len(self.items)} numbered things)"
+            ) from None
 
 
 class Browser:
@@ -215,6 +377,9 @@ class Browser:
         self.buffer = b""
         self.sent = 0
         self.timer: threading.Timer | None = None
+        self.base = ""  # the tab pages are read in
+        self.tabs: dict[object, str] = {}  # the tab each user of an open page has
+        self.views: dict[object, View] = {}  # and what was last seen in it
 
     # ---- the wire: "length:json", requests [0, id, name, params], replies [1, id, error, result] ----
 
@@ -291,12 +456,15 @@ class Browser:
             self._receive()  # its greeting
             self._command("WebDriver:NewSession", capabilities={"alwaysMatch": {"unhandledPromptBehavior": "dismiss"}})
             self._command("WebDriver:SetTimeouts", pageLoad=LOAD_SECONDS * 1000, script=10_000)
+            self.base = str(self._command("WebDriver:GetWindowHandle") or "")
         except (OSError, ValueError, BrowserError) as e:
             self.close()
             raise BrowserError(f"the browser started but could not be controlled: {e}") from None
 
     def close(self) -> None:
         with self.lock:
+            self.tabs.clear()
+            self.views.clear()
             if self.timer:
                 self.timer.cancel()
                 self.timer = None
@@ -327,7 +495,7 @@ class Browser:
         if self.timer:
             self.timer.cancel()
         if self.idle_seconds:
-            self.timer = threading.Timer(self.idle_seconds, self.close)
+            self.timer = threading.Timer(max(self.idle_seconds, PAGE_IDLE_SECONDS) if self.tabs else self.idle_seconds, self.close)
             self.timer.daemon = True
             self.timer.start()
 
@@ -339,6 +507,8 @@ class Browser:
         with self.lock:
             self._start()
             try:
+                if self.tabs:
+                    self._switch(self.base)
                 return self._read(url, allow_private)
             except (OSError, ValueError) as e:  # the browser died or stopped answering
                 self.close()
@@ -382,6 +552,123 @@ class Browser:
                 )
             raise BrowserError(problem or "the page has almost no readable text, even in a browser; it may need a login")
         return final_url, title or str(shown_title or ""), text
+
+
+    # ---- using a page: each user of one (a conversation) has a tab that stays open between steps ----
+
+    def _switch(self, handle: str) -> None:
+        self._command("WebDriver:SwitchToWindow", handle=handle, focus=False)
+
+    def _on_page(self, owner: object, act, new: bool = False) -> View:
+        with self.lock:
+            self._start()  # if the browser had been closed, this is a new one and the page is gone
+            try:
+                handle = self.tabs.get(owner)
+                if handle is None:
+                    if not new:
+                        raise BrowserError("no page is open in the browser any more; open it again with browser_open")
+                    handle = self.tabs[owner] = str(self._command("WebDriver:NewWindow", type="tab")["handle"])
+                self._switch(handle)
+                problem = act() or ""
+                return self._view(owner, problem)
+            except (OSError, ValueError, KeyError, TypeError) as e:  # the browser died or stopped answering
+                self.close()
+                raise BrowserError(f"the browser stopped responding: {e}") from None
+            finally:
+                if self.sock:
+                    self._close_when_idle()
+
+    def _view(self, owner: object, problem: str = "") -> View:
+        """Wait for the page to hold still, then describe it."""
+        handle = self.tabs[owner]
+        try:  # anything the page opened beside itself is closed
+            for other in self._command("WebDriver:GetWindowHandles") or []:
+                if other != self.base and other not in self.tabs.values():
+                    self._switch(other)
+                    self._command("WebDriver:CloseWindow")
+            self._switch(handle)
+        except BrowserError:
+            pass
+        deadline, size, same = time.monotonic() + self.settle_seconds, -1, 0
+        while time.monotonic() < deadline and same < 2:
+            time.sleep(0.4)
+            try:
+                ready, now = self._script(_READY)
+            except (BrowserError, TypeError, ValueError):
+                ready, now = "", -1  # between two pages
+            same, size = (same + 1 if ready == "complete" and now == size else 0), now
+        url = str(self._command("WebDriver:GetCurrentURL") or "")
+        if not url.startswith(("http://", "https://")):
+            self.views.pop(owner, None)
+            raise BrowserError(problem or "the page did not open")
+        try:
+            _check_public(url, False)
+        except FetchError:
+            self._command("WebDriver:Navigate", url="about:blank")
+            self.views.pop(owner, None)
+            raise
+        title, text, things, info = self._script(_VIEW, MAX_VIEW_CHARS)
+        items = [dict(what, ref=thing[ELEMENT]) for thing, what in zip(things, info)]
+        if len(text) < THIN_PAGE_CHARS and _CHALLENGE.search(str(self._script(_HAS_CHALLENGE) or "")):
+            text += "\n(The site wants proof that a person is there: a captcha. That is not yours to answer. The user can, with `private-ai browser`.)"
+        view = self.views[owner] = View(url, str(title or ""), str(text or ""), items)
+        return view
+
+    def page(self, owner: object) -> View:
+        """The page as it was last shown to this user of it."""
+        with self.lock:
+            view = self.views.get(owner)
+            if view is None or owner not in self.tabs:
+                raise BrowserError("no page is open in the browser; open one with browser_open")
+            return view
+
+    def open(self, owner: object, url: str) -> View:
+        """Open a page to be used, in this user's tab."""
+        _check_public(url, False)
+
+        def act():
+            try:
+                self._command("WebDriver:Navigate", url=url)
+            except BrowserError as e:
+                return str(e)  # too slow, perhaps: what did arrive may still be usable
+
+        return self._on_page(owner, act, new=True)
+
+    def look(self, owner: object) -> View:
+        """The page as it is now."""
+        return self._on_page(owner, lambda: None)
+
+    def click(self, owner: object, number: str | int) -> View:
+        item = self.page(owner).item(number)
+        return self._on_page(owner, lambda: self._command("WebDriver:ElementClick", id=item["ref"]) and None)
+
+    def fill(self, owner: object, number: str | int, text: str, enter: bool = False) -> View:
+        """Put text into a field, or choose from a list. With enter, press Enter afterwards."""
+        item = self.page(owner).item(number)
+        if item.get("secret"):
+            raise BrowserError(
+                "that is a password or payment card field, which only the user may fill in. "
+                "They can do it in the window that `private-ai browser` opens"
+            )
+        if item["kind"] not in ("field", "list"):
+            raise BrowserError(f"that is a {item['kind']}; use browser_click on it")
+        thing = {ELEMENT: item["ref"]}
+
+        def act():
+            if item["kind"] == "list":
+                if not self._script(_CHOOSE, thing, text):
+                    raise BrowserError(f"the list has no choice like \"{text[:80]}\"")
+                return
+            typed = text if item.get("many") else " ".join(text.splitlines())
+            try:
+                self._command("WebDriver:ElementClear", id=item["ref"])
+            except BrowserError:
+                pass  # some fields cannot be emptied this way; what is typed is added to what is there
+            self._command("WebDriver:ElementSendKeys", id=item["ref"], text=typed + ("\ue006" if enter else ""))
+            if enter:
+                time.sleep(min(1.0, self.settle_seconds))  # a new page, if there is to be one, has begun by now
+
+        return self._on_page(owner, act)
 
 
 _shared: Browser | None = None

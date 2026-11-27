@@ -33,6 +33,17 @@ Web rules:
 * Every page read is saved locally, so it can be found again later.
 * What comes back from the web is marked as untrusted before the model sees it.
 
+Browser rules (see browser.py for what the browser itself guarantees):
+* A page opened to be used is opened under the same rule as a page fetched.
+* Clicking and typing each need the user's approval, unless a rule of theirs
+  allows it for that site. The question shows what would be clicked and where
+  it leads, or exactly what would be typed and into what.
+* A click on something that looks as if it buys, sends, publishes, deletes or
+  signs up, or that belongs to a form with a password or card field, is asked
+  about every time with a warning, whatever the rules say. Only the trust
+  level "all" lifts this.
+* The assistant never types into a password or card field. The user signs in.
+
 Research rules:
 * A research job is many searches without a question for each, so starting
   one always asks, stating the service and the most it will do.
@@ -188,6 +199,41 @@ TOOLS = [
     ),
 ]
 
+# What there is when there is a browser to use (see browser.py).
+BROWSER_TOOLS = [
+    _tool(
+        "browser_open",
+        "Open a web page in a real browser to use it: to click things or fill in a form. To only read a page, "
+        "use fetch_page. Returns the page as text, in which everything that can be clicked or filled in is "
+        "marked with a number, like [4 field \"Search\" = \"\"] or [5 button \"Go\"]. The page stays open for "
+        "the other browser tools. The browser is signed in only where the user signed it in; you cannot sign in.",
+        url="The full address, starting with https://",
+    ),
+    _tool(
+        "browser_click",
+        "Click a numbered link, button, checkbox or other thing on the page open in the browser. The user "
+        "approves clicks according to their own rules. Returns the page as it is afterwards, with new numbers.",
+        number="The number of the thing, from the page as it was last shown.",
+    ),
+    _tool(
+        "browser_type",
+        "Type into a numbered field on the page open in the browser, replacing what is there, or choose from a "
+        "numbered list. The user sees what you type before it is typed. Passwords and card numbers are for the "
+        "user to enter, never you. Returns the page as it is afterwards, with new numbers.",
+        optional=("enter",),
+        number="The number of the field or list, from the page as it was last shown.",
+        text="What to type; for a list, the choice to make, as it is written.",
+        enter="Set to yes to press Enter afterwards, which is how a search box is usually sent.",
+    ),
+    _tool(
+        "browser_look",
+        "Show the page open in the browser as it is now: after waiting for something to appear, or to see a "
+        "later part of a long page.",
+        optional=("part",),
+        part="Which part of a long page to show, such as 2. Leave out to look at the page afresh.",
+    ),
+]
+
 # What the coding agent has on top of the above.
 CODE_TOOLS = [
     _tool(
@@ -274,7 +320,7 @@ class Toolbox:
         self.ui = ui
         self.provider = provider
         self.conversation_id: str | None = None
-        self.tools = TOOLS + CODE_TOOLS if coding else TOOLS
+        self.tools = TOOLS + (BROWSER_TOOLS if browser_module.shared() else []) + (CODE_TOOLS if coding else [])
         self.project = project or find_project()
         # Where relative paths start and commands run.
         self.cwd = self.project if coding else Path.cwd()
@@ -388,8 +434,7 @@ class Toolbox:
             lines.append(f"- {i['title']} [{i['source']}, {search.day(i['time'])}]\n  {i['url']}\n  {i['snippet']}")
         return "\n".join(lines)
 
-    def _fetch_page(self, url: str, browser: str = "") -> str:
-        url = url.strip()
+    def _approve_address(self, url: str) -> None:
         if self.pages >= MAX_PAGES_PER_MESSAGE:
             limit = MAX_PAGES_PER_MESSAGE
             raise ToolError(f"the limit of {limit} pages per message is reached; answer with what you have.")
@@ -403,6 +448,10 @@ class Toolbox:
                 raise ToolError("the user did not allow this address.")
             self.known_urls.add(url)
         self.pages += 1
+
+    def _fetch_page(self, url: str, browser: str = "") -> str:
+        url = url.strip()
+        self._approve_address(url)
         try:
             if browser.strip().lower() in ("yes", "true", "1"):
                 raise FetchError("the plain copy was not the whole page")
@@ -469,6 +518,94 @@ class Toolbox:
         return f"{UNTRUSTED}\n\n" + "\n\n".join(
             f"[{h['title']}, read {h['date']}]\n{h['url']}\n{h['excerpt']}" for h in hits
         )
+
+    # ---- using a page in the browser ----
+
+    def _browser(self) -> browser_module.Browser:
+        found = browser_module.shared()
+        if found is None:
+            raise ToolError("there is no browser to use.")
+        return found
+
+    def _view_text(self, view: browser_module.View, part: int = 1) -> str:
+        parts, current = [], ""
+        for line in view.text.split("\n"):
+            if current and len(current) + len(line) > MAX_PAGE_CHARS:
+                parts.append(current)
+                current = ""
+            current += line[:MAX_PAGE_CHARS] + "\n"
+        parts.append(current)
+        if not 1 <= part <= len(parts):
+            raise ToolError(f"the page has {len(parts)} part(s).")
+        more = ""
+        if len(parts) > 1:
+            more = f"\n[part {part} of {len(parts)} of a long page; browser_look with a part number shows another]"
+        return (
+            f"Page open in the browser: {view.title or '(no title)'}\nAddress: {view.url}\n{UNTRUSTED}\n"
+            "Numbers mark what can be clicked or filled in. They are new every time the page is shown.\n\n"
+            f"{parts[part - 1].rstrip()}{more}"
+        )
+
+    def _browser_open(self, url: str) -> str:
+        url = url.strip()
+        browser = self._browser()
+        self._approve_address(url)
+        self.ui.status(f"opening in the browser: {url[:120]}")
+        view = browser.open(self, url)
+        self.ui.notice(f"opened {view.url} in the browser")
+        self.known_urls.add(view.url)
+        self.store.save_page(view.url, view.title, view.text)
+        return self._view_text(view)
+
+    def _browser_look(self, part: str = "") -> str:
+        browser = self._browser()
+        if part.strip():
+            return self._view_text(browser.page(self), int(part))
+        return self._view_text(browser.look(self))
+
+    def _browser_click(self, number: str) -> str:
+        browser = self._browser()
+        view = browser.page(self)
+        item = view.item(number)
+        what = f"{item['kind']} \"{item['label']}\""
+        leads = ""
+        if item["href"].startswith(("http://", "https://")):
+            leads = f"\nIt leads to {item['href']}"
+        self._permit(
+            "click", view.host, f"Allow the assistant to click this on {view.host}?\n  {what}{leads}",
+            browser_module.consequential(item),
+        )
+        self.ui.status(f"clicking {what} on {view.host}")
+        after = browser.click(self, number)
+        self.ui.notice(f"clicked {what} on {view.host}")
+        if after.url != view.url:
+            self.known_urls.add(after.url)
+            self.store.save_page(after.url, after.title, after.text)
+        return self._view_text(after)
+
+    def _browser_type(self, number: str, text: str, enter: str = "") -> str:
+        browser = self._browser()
+        view = browser.page(self)
+        item = view.item(number)
+        press = enter.strip().lower() in ("yes", "true", "1")
+        if item["kind"] == "list":
+            what, verb = f"list \"{item['label']}\"", "choose this from"
+        else:
+            what, verb = f"field \"{item['label']}\"", "type this into"
+        if item.get("secret") or item["kind"] not in ("field", "list"):
+            browser.fill(self, number, text, press)  # says why not, without a question first
+        then = "\nEnter will be pressed afterwards, which usually sends the form." if press else ""
+        self._permit(
+            "type", view.host,
+            f"Allow the assistant to {verb} the {what} on {view.host}?\n  {text}{then}\nThe site may see it as it is typed.",
+        )
+        self.ui.status(f"typing into {what} on {view.host}")
+        after = browser.fill(self, number, text, press)
+        self.ui.notice(f"{'chose from' if item['kind'] == 'list' else 'typed into'} {what} on {view.host}: {text}")
+        if after.url != view.url:
+            self.known_urls.add(after.url)
+            self.store.save_page(after.url, after.title, after.text)
+        return self._view_text(after)
 
     # ---- research ----
 
@@ -554,6 +691,8 @@ class Toolbox:
                 "read": f"reading anything in {wider[0]}",
                 "write": f"changing any file in {wider[0]}",
                 "run": "commands of this kind: " + ", ".join(wider),
+                "click": f"clicking anything on {wider[0]}, except what looks as if it buys, sends or deletes",
+                "type": f"typing anything into {wider[0]}",
             }[action]
             local = ", while a local model is in use" if self.provider.is_local else ""
             question += f"\nA wider approval would cover {covers}{local}."

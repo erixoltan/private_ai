@@ -134,6 +134,7 @@ model can also ask for it when a plain copy was clearly not the whole page.
     private-ai browser                     # open the assistant's browser as a window
     private-ai browser https://example.org/login
     private-ai browser --read URL          # print a page as the assistant would read it
+    private-ai browser --look URL          # print it as the assistant sees it when using it
 
 * **A profile of its own.** The assistant's browser is separate from the one
   you browse with. It starts signed in to nothing, and your everyday history,
@@ -144,13 +145,15 @@ model can also ask for it when a plain copy was clearly not the whole page.
   you would see it, so sign in only where you want that. Passwords are not
   saved in the profile; the sign-in itself (the site's cookies) is. The
   assistant cannot use the browser while the window is open.
-* **It only looks.** The assistant can open an address and read the page. It
-  cannot click, type or submit anything. The rule for addresses is the same as
+* **Reading only looks.** When the assistant reads a page this way, nothing
+  is clicked, typed or submitted. The rule for addresses is the same as
   before: one that came from you or from a search or news result is read, and
   for any other you are asked.
 * **A page runs.** Unlike plain reading, the site sees an ordinary browser:
   its scripts run, it loads what it likes from other sites, and this profile's
   cookies are sent. A page is closed as soon as it has been read.
+* **Using a page is asked about.** The assistant can also open a page to use
+  it: follow links, press buttons, fill in a form. See below.
 * **Public sites only.** The browser is set up to refuse this machine and the
   local network, including when a page redirects there or tries to load
   something from there.
@@ -169,6 +172,40 @@ Some sites detect a remote-controlled browser and show a captcha instead of
 the page. The assistant does not answer those. It tells you, and you can open
 the page with `private-ai browser URL` and answer it yourself; the site may
 then let later reads through, though some never do.
+
+### Clicking and filling in forms
+
+In a conversation the assistant can open a page to use it. It sees the page
+as text in which everything that can be clicked or filled in has a number,
+and it clicks or types by number:
+
+    Customer name: [1 field "Customer name:" = ""]
+    [4 radio "Small", off] Small
+    [13 button "Submit order"]
+
+* **Each click and each thing typed is asked about first**, like a command.
+  The question for a click shows what is clicked and, for a link, where it
+  leads. The question for typing shows the exact words and the field, since
+  whatever is typed goes to the site.
+* **A site can be approved** for the session, the project or always, for
+  clicking and for typing separately. After that the assistant works on that
+  site without asking, and each step is still shown as it happens.
+* **What looks consequential is always asked.** A button or link that says
+  buy, pay, order, send, submit, post, delete, sign up, sign out and the
+  like, or that belongs to a form with a password or card field, is asked
+  about every time with a warning, even on an approved site. This goes by the
+  words on the button, so it is a help and not a guarantee: approve a whole
+  site only where a wrong click costs little.
+* **Never passwords or card numbers.** The assistant cannot type into a
+  password or payment card field, or choose a file to upload. Sign in
+  yourself with `private-ai browser`.
+* **The page stays open** between steps, running as pages do, until the
+  browser has gone unused for fifteen minutes. Research never clicks or
+  types; it only reads.
+
+What it does not do yet: pages inside frames are not shown, there is no
+dragging, hovering or scrolling, and it will not open this machine or the
+local network, so it cannot test a web app you are developing.
 
 To run SearXNG on this machine only, with Docker:
 
@@ -304,8 +341,9 @@ take as long as it needs, provided it is never silent for ten minutes.
 
 ## Approvals
 
-Reading a file, changing a file and running a command each need approval. A
-question can be answered five ways:
+Reading a file, changing a file, running a command, and clicking or typing on
+a web site in the browser each need approval. A question can be answered five
+ways:
 
     y) yes, once
     s) yes, and the same for this session
@@ -314,7 +352,8 @@ question can be answered five ways:
     n) no
 
 The wider answers cover more than the one request, and the question says what:
-any file in a folder, or commands of a kind, such as `git status *`. A command
+any file in a folder, commands of a kind, such as `git status *`, or clicks
+on one site. A command
 line joined with `&&`, `;` or `|` is allowed only when every part is. One that
 writes its output to a file, runs in the background or uses another command's
 output is asked about each time, and so are programs that run whatever they
@@ -337,8 +376,8 @@ can also write by hand. The assistant cannot read or change that file.
 
     [[rule]]
     decision = "allow"            # allow, ask or deny
-    action = "run"                # read, write or run
-    match = "git status *"        # a command pattern, or a path pattern
+    action = "run"                # read, write, run, click or type
+    match = "git status *"        # a command pattern, a path pattern, or a site
     project = "/home/me/code/x"   # optional: only in this project
     local_only = true             # optional: only with a local model
 
@@ -352,9 +391,16 @@ can also write by hand. The assistant cannot read or change that file.
     action = "write"
     match = "/etc/*"
 
+    [[rule]]                      # follow links and press buttons on this site unasked
+    decision = "allow"
+    action = "click"
+    match = "en.wikipedia.org"
+
 When rules disagree the strictest wins: deny, then ask, then allow. For paths,
 a folder covers everything in it, `*` matches anything including `/`, and a
-pattern that is not absolute is taken inside the project.
+pattern that is not absolute is taken inside the project. For `click` and
+`type` the match is a site: `example.org` covers it and every name under it,
+such as `www.example.org`, and `*` covers every site.
 
     private-ai approvals               # the saved rules that apply in this project
     /rules                             # the same, in the terminal chat, with session approvals

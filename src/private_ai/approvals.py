@@ -1,8 +1,10 @@
 """Who decides whether the assistant may do something: the user's rules, and
 failing those, the user.
 
-Three things are governed: reading a file ("read"), changing one ("write") and
-running a command ("run"). For each request the answer is allow, ask or deny.
+Five things are governed: reading a file ("read"), changing one ("write"),
+running a command ("run"), and in the browser clicking something on a web
+site ("click") and typing into one ("type"). For each request the answer is
+allow, ask or deny.
 
 Rules come from three places:
 
@@ -29,8 +31,8 @@ A rule in the file looks like this:
 
     [[rule]]
     decision = "allow"            # allow, ask or deny
-    action = "run"                # read, write or run
-    match = "git status *"        # a command pattern, or a path pattern
+    action = "run"                # read, write, run, click or type
+    match = "git status *"        # a command pattern, a path pattern, or a site
     project = "/home/me/code/x"   # optional: only when working in this project
     local_only = true             # optional: only while a local model is in use
 
@@ -42,6 +44,11 @@ Command patterns: "git status *" covers "git status" with any arguments, and
 only if every part is. One that redirects output, runs in the background or
 substitutes another command's output is too much to judge by pattern, so only
 "*" allows it.
+
+Sites: "example.org" covers that site and every name under it, such as
+www.example.org, and "*" covers every site. A rule for a site says nothing
+about what is clicked or typed there, so allow one only for sites where
+nothing much can go wrong, and see tools.py for what is asked regardless.
 
 Approvals given under a local model are saved as local_only: nothing was said
 about sending that file or that command's output to a cloud provider.
@@ -59,7 +66,8 @@ from pathlib import Path
 
 from private_ai.providers import config_path
 
-ACTIONS = ("read", "write", "run")
+ACTIONS = ("read", "write", "run", "click", "type")
+SITE_ACTIONS = ("click", "type")
 DECISIONS = ("allow", "ask", "deny")
 TRUST_LEVELS = ("ask", "project", "all")
 
@@ -178,6 +186,11 @@ def command_pattern(part: str) -> str | None:
     return f"{first} *"
 
 
+def _site_matches(pattern: str, host: str) -> bool:
+    pattern, host = pattern.strip().lower().lstrip("."), host.lower()
+    return pattern == "*" or fnmatchcase(host, pattern) or fnmatchcase(host, "*." + pattern)
+
+
 def _command_matches(pattern: str, part: str) -> bool:
     if pattern == "*":
         return True
@@ -271,9 +284,10 @@ class Policy:
         """allow, ask or deny, and the rule that settled it (None when no rule did)."""
         rules = [rule for rule in self.rules() if rule.action == action]
         if action != "run":
+            matches = _site_matches if action in SITE_ACTIONS else self._path_matches
             for decision in ("deny", "ask", "allow"):
                 for rule in rules:
-                    if rule.decision == decision and self._path_matches(rule.match, target):
+                    if rule.decision == decision and matches(rule.match, target):
                         return decision, rule
             return "ask", None
 
@@ -297,6 +311,8 @@ class Policy:
     def wider(self, action: str, target: str) -> list[str]:
         """Patterns that, if approved, would cover this request and others like
         it. Empty when the request is one that should only ever be approved once."""
+        if action in SITE_ACTIONS:
+            return [target]
         if action != "run":
             path = Path(target)
             inside = path == self.project or self.project in path.parents

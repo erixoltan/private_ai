@@ -158,6 +158,9 @@ def main(argv: list[str] | None = None) -> int:
     )
     p_browser.add_argument("url", nargs="?", help="a page to open")
     p_browser.add_argument("--read", action="store_true", help="instead, print the page as the assistant would read it")
+    p_browser.add_argument(
+        "--look", action="store_true", help="instead, print the page as the assistant sees it when using it, with numbers"
+    )
     p_search = sub.add_parser("search", help="run one web search and print the results (a test of a search service)")
     p_search.add_argument("query")
     p_search.add_argument("--with", dest="backend", metavar="NAME", help="search service to use (default: the one chat uses)")
@@ -230,6 +233,13 @@ def main(argv: list[str] | None = None) -> int:
                     parser.error("--read needs the address of a page")
                 final_url, title, text = browser.read_page(args.url)
                 print(f"{title}\n{final_url}\n\n{text}")
+                return 0
+            if args.look:
+                found = browser.shared()
+                if not args.url or not found:
+                    parser.error("--look needs the address of a page, and Firefox")
+                view = found.open("look", args.url)
+                print(f"{view.title}\n{view.url}\n\n{view.text}")
                 return 0
             program = browser.firefox_program()
             print(f"Profile: {browser.profile_dir(program)}")
